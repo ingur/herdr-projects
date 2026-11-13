@@ -65,13 +65,16 @@ export function removeRecord(stateDir, id) {
   rmSync(recordPath(stateDir, id), { force: true });
 }
 
+export function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === "EPERM"; }
+}
+
 // The lock file holds its owner's pid; a lock whose owner died is taken over.
 function abandoned(path) {
-  let pid;
-  try { pid = Number(readFileSync(path, "utf8")); }
+  try { return !alive(Number(readFileSync(path, "utf8"))); }
   catch { return false; }
-  try { process.kill(pid, 0); return false; }
-  catch (error) { return error.code === "ESRCH"; }
 }
 
 export async function locked(stateDir, id, fn, io = {}) {

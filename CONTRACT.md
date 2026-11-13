@@ -27,12 +27,12 @@ the session's lock file, which holds the owner's pid; a lock whose owner died is
 
 ## Running
 
-Core asks hc for live terminals labelled `projects.session=<id>`. `running`: one of them reports
-an agent status (`idle`, `working`, `done`, `blocked`, `error`). `starting`: none does yet and
-one was created less than 60 s ago. `stopped`: anything else; a labelled terminal without a
-status after 60 s is a shell left behind, and the next launch removes its `projects.*` labels.
-Before every `hc send` core reads the terminal again; it must carry the label and report a
-status other than `blocked`, so nothing is ever typed into a shell.
+A terminal holds a session while it is live, carries `projects.session=<id>`, and the process in
+its `projects.pid` is alive. `running`: it reports an agent status (`idle`, `working`, `done`,
+`blocked`, `error`). `starting`: no status yet, however long that takes. `stopped`: nothing holds
+it; a labelled terminal whose agent died is left behind, and the next launch clears its
+`projects.*` labels. Right before every `hc send` core checks that the terminal still holds the
+session and reports a status other than `blocked`.
 
 ## Messages
 
@@ -46,14 +46,14 @@ From the user it is `<message from="user">`. `&`, `"`, `<`, `>` in attribute val
 Text is 1 to 100000 characters. `send {to, from?, text}` (`from` absent means the user):
 
 1. A resolved thread is reopened when its coordinator or the user sends; others are refused.
-2. `running`: `blocked` types and stores nothing (`sent: false`). Otherwise hc types it; when the
-   recipient was `idle` or `done` and no turn started, the note says so.
-3. `starting`: wait up to 30 s for `running`, then as 2, else as 4 or 5.
-4. A stopped thread: the message joins `waiting`, the thread is launched, waiting mail goes out.
-5. A stopped coordinator: the message joins `waiting`. Only the user resumes a project.
+2. The message joins `waiting`, behind any older mail.
+3. `running`: waiting mail goes out now. `blocked` keeps it stored until the next delivery.
+4. `starting`: it stays stored and goes out at the session's `register`.
+5. A stopped thread is launched and its mail goes out; a stopped coordinator keeps it for the user.
 
-Waiting mail goes out (after `send` launched a thread, after `create-thread`, at every
-`register`) once the session reports a status within 60 s: in order, each removed once hc took it.
+Delivery types waiting mail in order and removes each message once hc took it. After a launch
+and at `register` it waits up to 60 s for the session to run. `sent` is true only when this
+message was typed; when the recipient was `idle` or `done` and no turn started, the note says so.
 
 ## Actions
 
@@ -65,9 +65,9 @@ functions are `actions[name](options, io)` in `core/control.mjs`, next to `state
 | Action | Options | Does |
 |---|---|---|
 | `list` | `{}` | `{sessions: [view], errors?}`: coordinators by rank, highest first, each followed by its threads, unresolved first, by rank |
-| `register` | `{id?, title?, cwd, agent, adapter, terminal}` | Binds the conversation in an hc terminal; without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another live terminal with a status carries the label. Labels the terminal, saves `adapter`, `cwd` and placement, reopens unresolved `reopenWithProject` threads, delivers waiting mail |
+| `register` | `{id?, title?, cwd, agent, adapter, terminal, pid}` | Binds the conversation in an hc terminal; `pid` is the agent's own process. Without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another terminal holds the session. Labels the terminal, saves `adapter`, `cwd` and placement, reopens unresolved `reopenWithProject` threads, delivers waiting mail |
 | `release` | `{id}` | The session leaves its terminal: `projects.*` labels go; a coordinator's running threads are closed and flagged `reopenWithProject` |
-| `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case), at most 80 characters, not `coordinator`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
+| `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case, also on rename), at most 80 characters, not `coordinator`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
 | `open` | `{id, space?}` | Launches when stopped; returns once the terminal exists |
 | `send` | `{to, from?, text}` | As above; adds `sent` and `note?` |
 | `rename` | `{id, title, by}` | An agent cannot change a `user` title |
@@ -89,11 +89,12 @@ status (hc's word, only when running), waiting (count), error?
 
 `hc run --bg --json --no-parent --cwd CWD --name SLUG-ID8 [--label herdr.space=S --label
 herdr.tab=T] --label projects.session=ID --label projects.control=… -- env K=V …
-PROJECTS_SESSION=ID <adapter argv>`. A thread starts in its coordinator's space while that runs,
-else in its recorded space, else unplaced. hc has no rename, so `register` cannot name a
-terminal. A failed `hc run` gives the result an `error`; waiting mail stays.
+PROJECTS_SESSION=ID <adapter argv>`, then `projects.pid` from the pid hc reports (`env` execs the
+agent). A thread starts in its coordinator's space while that runs, else in its recorded space,
+else unplaced. A failed `hc run` gives an `error`; mail stays.
 
 - `projects.session=<id>`: the terminal running that session.
+- `projects.pid=<pid>`: the agent process; the terminal counts only while it is alive.
 - `projects.control={"version":2,"command":["<stateDir>/bin/control"],"stateDir":"…"}`.
 - `projects.changed=<ms>`: set after a change, on the session's terminal or its coordinator's.
 
@@ -111,7 +112,9 @@ regular file inside a Pi sessions directory whose header names `sessionId`.
 
 ## Known limits
 
-- Messages are typed text by convention, not a security boundary.
+- Messages are typed text by convention, not a security boundary. If one ever reached a shell,
+  its first line fails, but later lines of a multi-line message would run.
+- After a hard kill, another process that gets the same pid makes the terminal look alive.
 - A picker open in the agent swallows a message; when the agent was working this is silent.
 - A draft left untouched for 60 s stops holding messages (hc's `draft_wait`).
 - A tool that asks a startup question reports no status until it is answered; mail waits.

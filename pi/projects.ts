@@ -63,7 +63,7 @@ async function project(id: string) {
 
 function find(target: string, me, sessions) {
   const view = target === "coordinator" ? sessions.find(view => view.id === me.coordinator)
-    : sessions.find(view => view.id === target) ?? sessions.find(view => view.role === "thread" && view.title === target);
+    : sessions.find(view => view.id === target) ?? sessions.find(view => view.role === "thread" && view.title.toLowerCase() === target.toLowerCase());
   if (!view) throw new Error(`No session "${target}" in this project. Call thread_list for titles and session ids.`);
   return view;
 }
@@ -100,7 +100,7 @@ export default function projects(pi: ExtensionAPI) {
     const stateDir = stateDirectory();
     if (bound || piRecord(stateDir, "sessionId", ctx.sessionManager.getSessionId())) throw new Error("This conversation is already in a project.");
     if (!ctx.sessionManager.getSessionFile()) throw new Error("Projects needs a saved Pi session; do not use --no-session.");
-    const view = await actions.register({ title: name || pi.getSessionName(), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx, stateDir), terminal: process.env.HC_TERMINAL_ID });
+    const view = await actions.register({ title: name || pi.getSessionName(), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx, stateDir), terminal: process.env.HC_TERMINAL_ID, pid: process.pid });
     bind(stateDir, view);
     ctx.ui.notify(`Project ${view.title} uses this conversation.`, "info");
   }
@@ -114,7 +114,7 @@ export default function projects(pi: ExtensionAPI) {
     bind(stateDir, record);
     const binding = bound;
     // register returns once waiting mail is typed, which needs this Pi running, so do not wait for it.
-    actions.register({ id: record.id, cwd: ctx.cwd, agent: "pi", adapter: data, terminal }).catch(error => {
+    actions.register({ id: record.id, cwd: ctx.cwd, agent: "pi", adapter: data, terminal, pid: process.pid }).catch(error => {
       if (bound !== binding) return;
       unbind();
       applyTools();

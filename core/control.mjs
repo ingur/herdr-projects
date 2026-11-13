@@ -5,16 +5,17 @@ import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { adapter, agents } from "./adapters.mjs";
-import { hc, observe, statusWord } from "./hc.mjs";
+import { classify, details, hc, holds, observe, statusWord } from "./hc.mjs";
 import { findRecord, locked, readRecord, readRecords, removeRecord, rewrite, stateDirectory, update, writeExecutable, writeRecord } from "./store.mjs";
 
 export { findRecord, readRecord, stateDirectory };
 
 const STORED = {
+  starting: "stored; it goes out when the session starts",
+  blocked: "stored; the session is waiting on the user",
   coordinator: "stored; it goes out when the user resumes the project",
-  thread: "stored; it goes out when the thread starts",
 };
-const UNLABEL = ["projects.session=", "projects.control=", "projects.changed="];
+const UNLABEL = ["projects.session=", "projects.pid=", "projects.control=", "projects.changed="];
 const errorText = error => error instanceof Error ? error.message : String(error);
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const descriptor = stateDir => JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir });
@@ -99,29 +100,32 @@ async function running(io, id, seconds) {
   }
 }
 
-// Reads the terminal right before typing: a shell left behind the label reports no status and is never typed into.
+// Right before typing, the terminal must still hold the session (label and live agent pid) and report a status.
 async function type(io, id, address, message) {
   const row = await hc(io, ["get", address, "--json"]);
   const status = statusWord(row.status);
-  if (row.state !== "live" || row.labels?.["projects.session"] !== id || !status) return { sent: false, note: "not typed: the session stopped; send it again" };
-  if (status === "blocked") return { sent: false, note: "not typed: the session is waiting on the user" };
+  if (!holds(row, id) || !status) return { held: "starting" };
+  if (status === "blocked") return { held: "blocked" };
   const result = await hc(io, ["send", "--json", address, message]);
-  return { sent: true, ...(result.started === false && (status === "idle" || status === "done") ? { note: "typed, but no turn started" } : {}) };
+  return result.started === false && (status === "idle" || status === "done") ? { note: "typed, but no turn started" } : {};
 }
 
-// Types waiting mail in order and removes each message once hc accepted it; the rest stays for the next register.
-async function deliver(stateDir, id, io) {
+// Types waiting mail in order, removing each message once hc took it, after waiting up to `seconds`
+// for the session to run. `held` says why mail is still waiting; `note` is about the last message typed.
+async function deliver(stateDir, id, io, seconds = 0) {
   if (!session(stateDir, id).waiting.length) return {};
   try {
-    const observed = await running(io, id, 60);
-    if (observed.state !== "running") return {};
-    await locked(stateDir, id, async () => {
+    const observed = await running(io, id, seconds);
+    if (observed.state !== "running") return { held: observed.state };
+    return await locked(stateDir, id, async () => {
+      let typed = {};
       for (let [next] = session(stateDir, id).waiting; next; [next] = session(stateDir, id).waiting) {
-        if (!(await type(io, id, observed.terminal.address, wrap(next))).sent) return;
+        typed = await type(io, id, observed.terminal.address, wrap(next));
+        if (typed.held) return typed;
         rewrite(stateDir, id, record => ({ waiting: record.waiting.slice(1) }));
       }
+      return typed;
     }, io);
-    return {};
   } catch (error) { return { error: errorText(error) }; }
 }
 
@@ -130,17 +134,20 @@ async function launch(stateDir, id, io, place) {
     return await locked(stateDir, id, async () => {
       const record = session(stateDir, id), observed = await observe(io, id);
       if (observed.state !== "stopped") return {};
-      for (const row of observed.live) await hc(io, ["label", row.address, "--json", ...UNLABEL]);
+      for (const row of observed.labelled) await hc(io, ["label", row.address, "--json", ...UNLABEL]);
       let target = place ?? record.space;
       if (place === undefined && record.role === "thread") target = (await observe(io, record.coordinator)).terminal?.labels["herdr.space"] ?? target;
       const tab = target === undefined ? undefined : record.tab ?? `pt-${id}`;
       const module = await adapter(record.agent);
       const argv = module.resume(record) ?? module.start(record);
       const env = Object.entries(module.env(record)).map(([key, value]) => `${key}=${value}`);
-      await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd, "--name", terminalName(record),
+      const { address } = await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd, "--name", terminalName(record),
         ...(target === undefined ? [] : ["--label", `herdr.space=${target}`, "--label", `herdr.tab=${tab}`]),
         "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`,
         "--", "env", ...env, `PROJECTS_SESSION=${id}`, ...argv]);
+      // With `env … agent`, env execs the agent, so the program pid hc reports is the agent's.
+      const { pid } = await hc(io, ["get", address, "--json"]);
+      await hc(io, ["label", address, "--json", `projects.pid=${pid}`]);
       rewrite(stateDir, id, () => ({ space: target, tab }));
       return {};
     }, io);
@@ -152,7 +159,7 @@ async function stop(stateDir, id, io) {
   const { terminal } = await observe(io, id);
   if (!terminal) return;
   const current = await hc(io, ["get", terminal.address, "--json"]);
-  if (current.state !== "live" || current.labels?.["projects.session"] !== id) return;
+  if (!holds(current, id)) return;
   await remember(stateDir, id, current, io);
   const killed = await hc(io, ["kill", current.address, "--json"]);
   if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
@@ -179,10 +186,12 @@ export const actions = {
   async list(options = {}, io = {}) {
     const stateDir = stateDirectory(options.stateDir);
     const { records, errors } = readRecords(stateDir);
-    const sessions = await Promise.all(records.map(async record => {
-      try { return view(record, await observe(io, record.id)); }
-      catch (error) { return view(record, undefined, errorText(error)); }
-    }));
+    let rows, error;
+    if (records.length) {
+      try { rows = await details(io, `projects.control=${descriptor(stateDir)}`); }
+      catch (caught) { error = errorText(caught); }
+    }
+    const sessions = records.map(record => view(record, rows && classify(rows, record.id), error));
     const ranks = new Map(sessions.filter(view => view.role === "coordinator").map(view => [view.id, view.rank]));
     sessions.sort((a, b) => (ranks.get(b.coordinator) ?? 0) - (ranks.get(a.coordinator) ?? 0) || a.coordinator.localeCompare(b.coordinator) ||
       Number(a.role === "thread") - Number(b.role === "thread") || Number(a.resolved) - Number(b.resolved) || b.rank - a.rank || a.id.localeCompare(b.id));
@@ -195,6 +204,7 @@ export const actions = {
     if (typeof options.cwd !== "string" || !isAbsolute(options.cwd)) throw new Error("cwd must be an absolute path");
     if (!options.adapter || typeof options.adapter !== "object" || Array.isArray(options.adapter)) throw new Error("adapter must be an object");
     if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name an hc terminal");
+    if (!Number.isInteger(options.pid) || options.pid <= 0) throw new Error("pid must be the agent's process id");
     const promoted = options.id === undefined, id = promoted ? randomUUID() : session(stateDir, options.id).id;
     if (promoted) {
       const created = new Date();
@@ -207,9 +217,9 @@ export const actions = {
       await locked(stateDir, id, async () => {
         const row = await hc(io, ["get", options.terminal, "--json"]);
         if (row.state !== "live") throw new Error(`Terminal ${row.address} is not live`);
-        const other = (await observe(io, id)).live.find(live => live.address !== row.address && statusWord(live.status));
+        const other = (await observe(io, id)).labelled.find(live => live.address !== row.address && holds(live, id));
         if (other) throw new Error(`This session is already open in terminal ${other.address}`);
-        await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.control=${descriptor(stateDir)}`]);
+        await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}`, `projects.control=${descriptor(stateDir)}`]);
         rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,
           space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }));
       }, io);
@@ -225,14 +235,14 @@ export const actions = {
       const { error } = await launch(stateDir, thread.id, io);
       if (error) errors.push(`${thread.title}: ${error}`);
     }
-    const { error } = await deliver(stateDir, id, io);
+    const { error } = await deliver(stateDir, id, io, 60);
     if (error) errors.push(error);
     return changed(stateDir, id, io, errors.length ? { error: errors.join("; ") } : {});
   },
 
   async release(options, io = {}) {
     const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
-    for (const row of (await observe(io, record.id)).live) {
+    for (const row of (await observe(io, record.id)).labelled) {
       await remember(stateDir, record.id, row, io);
       await hc(io, ["label", row.address, "--json", ...UNLABEL]);
     }
@@ -265,7 +275,9 @@ export const actions = {
     }, io);
     if (existing) return changed(stateDir, existing.id, io, { existing: true });
     const launched = await launch(stateDir, record.id, io);
-    return changed(stateDir, record.id, io, launched.error ? launched : await deliver(stateDir, record.id, io));
+    if (launched.error) return changed(stateDir, record.id, io, launched);
+    const { error } = await deliver(stateDir, record.id, io, 60);
+    return changed(stateDir, record.id, io, error ? { error } : {});
   },
 
   async open(options, io = {}) {
@@ -284,27 +296,32 @@ export const actions = {
       await update(stateDir, recipient.id, () => ({ resolved: false }), io);
     }
     const message = { from: sender?.role ?? "user", ...(sender ? { title: sender.title, id: sender.id } : {}), text, created: new Date().toISOString() };
-    let observed = await observe(io, recipient.id);
-    if (observed.state === "starting") observed = await running(io, recipient.id, 30);
-    if (observed.state === "running") return changed(stateDir, recipient.id, io, await type(io, recipient.id, observed.terminal.address, wrap(message)));
     await update(stateDir, recipient.id, record => ({ waiting: [...record.waiting, message] }), io);
-    if (recipient.role === "coordinator") return changed(stateDir, recipient.id, io, { sent: false, note: STORED.coordinator });
-    const launched = await launch(stateDir, recipient.id, io);
-    const { error } = launched.error ? launched : await deliver(stateDir, recipient.id, io);
-    const sent = !session(stateDir, recipient.id).waiting.length;
-    return changed(stateDir, recipient.id, io, { sent, ...(sent ? {} : { note: STORED.thread }), ...(error ? { error } : {}) });
+    const observed = await observe(io, recipient.id);
+    let result = { held: observed.state };
+    if (observed.state === "running") result = await deliver(stateDir, recipient.id, io);
+    else if (observed.state === "stopped" && recipient.role === "thread") {
+      const launched = await launch(stateDir, recipient.id, io);
+      result = launched.error ? { ...launched, held: "stopped" } : await deliver(stateDir, recipient.id, io, 60);
+    }
+    const sent = !session(stateDir, recipient.id).waiting.some(entry => JSON.stringify(entry) === JSON.stringify(message));
+    const note = sent ? result.note : result.held === "blocked" ? STORED.blocked
+      : recipient.role === "coordinator" && result.held === "stopped" ? STORED.coordinator : STORED.starting;
+    return changed(stateDir, recipient.id, io, { sent, ...(note ? { note } : {}), ...(result.error ? { error: result.error } : {}) });
   },
 
   async rename(options, io = {}) {
     const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
     const by = author(options.by), name = title(options.title, record.role);
-    await update(stateDir, record.id, current => {
+    const change = current => {
       if (by === "agent" && current.titleSource === "user") throw new Error("The user chose this title; an agent cannot change it");
       if (current.role === "thread" && threads(stateDir, current.coordinator).some(thread => thread.id !== current.id && thread.title.toLowerCase() === name.toLowerCase())) {
         throw new Error(`Another thread is already called ${name}`);
       }
       return { title: name, titleSource: by };
-    }, io);
+    };
+    // Thread titles are checked under the coordinator's lock, as in create-thread.
+    await locked(stateDir, record.coordinator, () => record.role === "thread" ? update(stateDir, record.id, change, io) : rewrite(stateDir, record.id, change), io);
     return changed(stateDir, record.id, io);
   },
 

@@ -53,3 +53,10 @@ node --test tests/*.test.mjs
 ```
 
 Other agent tools can plug into the same projects: see [CONTRACT.md](CONTRACT.md).
+
+## Known limits
+
+- Messages wait while you type, but a draft left alone for a minute no longer holds them.
+- A picker open in the agent swallows a message.
+- Threads get hc's environment plus Pi's own settings, not variables exported only in the coordinator's shell.
+- Needs hc 0.1.20 or newer.

@@ -16,12 +16,16 @@ trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$work" "$transcripts"' EXI
 
 adapter=$(jq -nc --arg dir "$PI_CODING_AGENT_DIR" --arg path "$PATH" '{command: ["pi", "--no-extensions"], env: {PI_CODING_AGENT_DIR: $dir, PATH: $path}}')
 control() { node "$repo/core/control.mjs" "$@"; }
-register() { control register "$(jq -nc --arg cwd "$work" --arg t "$1" --argjson a "$adapter" "{cwd: \$cwd, agent: \"pi\", terminal: \$t, adapter: \$a} + $2")"; }
-send() {
-  result=$(control send "$(jq -nc --arg to "$1" --arg from "$2" '{to: $to, from: $from, text: "Reply with the single word ok. Do not use tools."}')")
-  printf '%s\n' "$result" | jq -e .sent >/dev/null || { echo "smoke: not sent: $result" >&2; exit 1; }
-  hc wait --timeout 180 "$3" >/dev/null
-  [ "$(hc get "$3" --json | jq .turn)" -gt 0 ] || { echo "smoke: no turn in $3" >&2; exit 1; }
+fail() { echo "smoke: $*" >&2; exit 1; }
+# The terminal runs `env … pi`, which execs Pi, so hc's program pid is Pi's.
+register() {
+  pid=$(hc get "$1" --json | jq .pid)
+  control register "$(jq -nc --arg cwd "$work" --arg t "$1" --argjson pid "$pid" --argjson a "$adapter" "{cwd: \$cwd, agent: \"pi\", terminal: \$t, pid: \$pid, adapter: \$a} + $2")"
+}
+send() { control send "$(jq -nc --arg to "$1" --arg from "$2" '{to: $to, from: $from, text: "Reply with the single word ok. Do not use tools."}')"; }
+turned() {
+  hc wait --timeout 180 "$1" >/dev/null
+  [ "$(hc get "$1" --json | jq .turn)" -gt 0 ] || fail "no turn in $1"
 }
 
 t1=$(hc run --bg --json --no-parent --cwd "$work" -- env PATH="$PATH" PI_CODING_AGENT_DIR="$PI_CODING_AGENT_DIR" pi --no-extensions | jq -r .address)
@@ -29,7 +33,10 @@ coordinator=$(register "$t1" '{title: "Smoke"}' | jq -r .id)
 thread=$(control create-thread "$(jq -nc --arg c "$coordinator" '{coordinator: $c, title: "helper", by: "user"}')")
 t2=$(printf '%s\n' "$thread" | jq -r .terminal)
 thread=$(printf '%s\n' "$thread" | jq -r .id)
-register "$t2" "$(jq -nc --arg id "$thread" '{id: $id}')" >/dev/null
-send "$thread" "$coordinator" "$t2"
-send "$coordinator" "$thread" "$t1"
+# Typed at once if the thread is up, else stored until its register.
+send "$thread" "$coordinator" >/dev/null
+register "$t2" "$(jq -nc --arg id "$thread" '{id: $id}')" | jq -e '.waiting == 0' >/dev/null || fail "mail to the thread is still waiting"
+turned "$t2"
+send "$coordinator" "$thread" | jq -e .sent >/dev/null || fail "not sent to the coordinator"
+turned "$t1"
 echo "smoke: ok"

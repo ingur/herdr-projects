@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import { writeRecord } from "../core/store.mjs";
 import { remove } from "../pi/adapter.mjs";
 
 const control = fileURLToPath(new URL("../core/control.mjs", import.meta.url));
+const DEAD = 2 ** 31 - 1; // above any pid_max, so no process has it
 
 function fixture(t) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-projects-")));
@@ -27,7 +28,10 @@ function fixture(t) {
     writeFileSync(path, JSON.stringify({ type: "session", id, cwd }) + "\n");
     return path;
   };
-  return { root, stateDir, cwd, agentDir, adapter, save, transcript, options: { stateDir } };
+  // Labels of a terminal bound to a session, as register and launch set them.
+  const bound = (id, pid = process.pid) => ({ "projects.session": id, "projects.pid": String(pid),
+    "projects.control": JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir }) });
+  return { root, stateDir, cwd, agentDir, adapter, save, transcript, bound, options: { stateDir } };
 }
 
 // A fake hc: `ls` gives short rows, `get` the full terminal with status as {app, state}.
@@ -41,7 +45,7 @@ function hc() {
   const io = {
     rows, calls, delay: () => new Promise(resolve => setImmediate(resolve)),
     terminal(labels = {}, status = "idle", age = 0) {
-      const row = { address: `t${rows.length + 1}`, state: "live", labels, status: status ? { app: "pi", state: status } : null, created_ms: Date.now() - age, typed: [] };
+      const row = { address: `t${rows.length + 1}`, state: "live", pid: process.pid, labels, status: status ? { app: "pi", state: status } : null, created_ms: Date.now() - age, typed: [] };
       rows.push(row);
       return row;
     },
@@ -110,7 +114,7 @@ test("delete removes only the conversations of the deleted sessions", async t =>
     files[record.id] = f.transcript(sessionId);
     writeRecord(f.stateDir, { ...record, adapter: { ...f.adapter, sessionId, sessionFile: files[record.id] } });
   }
-  const running = io.terminal({ "projects.session": thread.id });
+  const running = io.terminal(f.bound(thread.id));
   assert.deepEqual((await actions.delete({ ...f.options, id: coordinator.id }, io)).deleted, [thread.id, coordinator.id]);
   assert.equal(running.state, "finished");
   assert.equal(existsSync(files[coordinator.id]), false);
@@ -130,7 +134,7 @@ test("delete removes only the conversations of the deleted sessions", async t =>
 test("close kills only a terminal that still carries the session's label", async t => {
   const f = fixture(t), io = hc(), thread = f.save({ role: "thread", coordinator: randomUUID() });
   const bystander = io.terminal({});
-  const row = io.terminal({ "projects.session": thread.id });
+  const row = io.terminal(f.bound(thread.id));
   let gets = 0;
   io.onGet = found => { if (found === row && ++gets === 2) delete row.labels["projects.session"]; };
   await actions.close({ ...f.options, id: thread.id }, io);
@@ -142,34 +146,39 @@ test("close kills only a terminal that still carries the session's label", async
   assert.equal(bystander.state, "live");
 });
 
-test("a shell left behind the label is never typed into", async t => {
-  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
-  const coordinatorShell = io.terminal({ "projects.session": coordinator.id }, null, 120_000);
-  const threadShell = io.terminal({ "projects.session": thread.id }, null, 120_000);
+test("a terminal counts only while the agent process it names is alive", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save();
+  const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const leftBehind = io.terminal(f.bound(coordinator.id, DEAD), "idle");
   const stored = await actions.send({ ...f.options, to: coordinator.id, from: thread.id, text: "result" }, io);
-  assert.equal(stored.sent, false);
-  assert.equal(stored.waiting, 1);
+  assert.deepEqual([stored.state, stored.sent, stored.waiting], ["stopped", false, 1]);
+  assert.deepEqual(leftBehind.typed, []);
+
+  const slow = io.terminal(f.bound(thread.id), null, 120_000);
+  assert.equal((await actions.list(f.options, io)).sessions.find(view => view.id === thread.id).state, "starting");
+  const waiting = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "work" }, io);
+  assert.deepEqual([waiting.state, waiting.sent, waiting.note], ["starting", false, "stored; it goes out when the session starts"]);
+  assert.deepEqual(slow.typed, []);
+  assert.equal(verbs(io, "run").length, 0);
+});
+
+test("a stopped thread is launched under its live pid and gets its mail", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const shell = io.terminal({ "projects.session": thread.id }, "idle");
   io.onRun = row => { row.status = { app: "pi", state: "idle" }; };
   const sent = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "work" }, io);
   assert.equal(sent.sent, true);
-  assert.deepEqual(coordinatorShell.typed, []);
-  assert.deepEqual(threadShell.typed, []);
-  assert.equal(threadShell.labels["projects.session"], undefined, "launching cleared the stale label");
+  assert.deepEqual(shell.typed, []);
+  assert.equal(shell.labels["projects.session"], undefined, "launching cleared the label left behind");
   const launched = io.rows.at(-1);
+  assert.equal(launched.labels["projects.pid"], String(process.pid));
   assert.deepEqual(launched.typed, [wrap({ from: "coordinator", title: coordinator.title, id: coordinator.id, text: "work" })]);
-  assert.equal(launched.labels["projects.session"], thread.id);
-
-  launched.status = { app: "pi", state: "blocked" };
-  const blocked = await actions.send({ ...f.options, to: thread.id, text: "more" }, io);
-  assert.equal(blocked.sent, false);
-  assert.equal(blocked.waiting, 0);
-  assert.equal(launched.typed.length, 1);
 });
 
 test("double launch is refused", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
   const first = io.terminal({}), second = io.terminal({});
-  const register = terminal => actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: coordinator.adapter, terminal }, io);
+  const register = terminal => actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: coordinator.adapter, terminal, pid: process.pid }, io);
   await register(first.address);
   await assert.rejects(register(second.address), /already open in terminal t1/);
   assert.equal(second.labels["projects.session"], undefined);
@@ -187,7 +196,7 @@ test("waiting mail is kept in order and handed over once", async t => {
   const terminal = io.terminal({});
   let failed = false;
   io.onSend = (row, text) => { if (text.includes("\nthree\n") && !failed) { failed = true; throw new Error("hc send: lost"); } };
-  const register = () => actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: coordinator.adapter, terminal: terminal.address }, io);
+  const register = () => actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: coordinator.adapter, terminal: terminal.address, pid: process.pid }, io);
   const first = await register();
   assert.equal(first.waiting, 1);
   assert.match(first.error, /lost/);
@@ -198,11 +207,24 @@ test("waiting mail is kept in order and handed over once", async t => {
   assert.deepEqual(readRecord(f.stateDir, coordinator.id).waiting, []);
 });
 
+test("a blocked session keeps the message and later mail does not overtake it", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const row = io.terminal(f.bound(thread.id), "blocked");
+  const held = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "first" }, io);
+  assert.deepEqual([held.sent, held.note, held.waiting], [false, "stored; the session is waiting on the user", 1]);
+  assert.deepEqual(row.typed, []);
+  row.status = { app: "pi", state: "idle" };
+  const later = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "second" }, io);
+  assert.deepEqual([later.sent, later.waiting], [true, 0]);
+  const message = text => wrap({ from: "coordinator", title: coordinator.title, id: coordinator.id, text });
+  assert.deepEqual(row.typed, [message("first"), message("second")]);
+});
+
 test("only its coordinator or the user reopens a resolved thread by sending", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save();
   const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker", resolved: true });
   const peer = f.save({ role: "thread", coordinator: coordinator.id, title: "Peer" });
-  const row = io.terminal({ "projects.session": thread.id });
+  const row = io.terminal(f.bound(thread.id));
   await assert.rejects(actions.send({ ...f.options, to: thread.id, from: peer.id, text: "hi" }, io), /resolved/);
   assert.equal(readRecord(f.stateDir, thread.id).resolved, true);
   assert.equal((await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "again" }, io)).resolved, false);

@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { alive } from "./store.mjs";
 
 const run = promisify(execFile);
-const STARTING = 60_000;
 
 async function command(program, args) {
   try {
@@ -24,16 +24,29 @@ export function statusWord(status) {
   return typeof status === "string" ? status : status?.state;
 }
 
-// Live terminals carrying the session's label: `running` once its agent reports a status,
-// `starting` for 60 s before that, else `stopped`.
-export async function observe(io, id) {
-  const { terminals } = await hc(io, ["ls", "--json", "--label", `projects.session=${id}`]);
-  const rows = await Promise.all(terminals.filter(row => row.state === "live" && !row.address.includes("/"))
+// A labelled terminal holds the session only while the agent process named by projects.pid is alive.
+export function holds(row, id) {
+  return row.state === "live" && row.labels?.["projects.session"] === id && alive(Number(row.labels["projects.pid"]));
+}
+
+// `running` once the agent reports a status, `starting` while it is alive without one, else `stopped`.
+// `labelled` also lists terminals left behind by an agent that died.
+export function classify(rows, id) {
+  const labelled = rows.filter(row => row.state === "live" && row.labels?.["projects.session"] === id);
+  const agents = labelled.filter(row => holds(row, id));
+  const running = agents.find(row => statusWord(row.status));
+  if (running) return { state: "running", status: statusWord(running.status), terminal: running, labelled };
+  if (agents.length) return { state: "starting", terminal: agents[0], labelled };
+  return { state: "stopped", labelled };
+}
+
+// `hc ls` rows are short; `hc get` gives labels, pid and status.
+export async function details(io, label) {
+  const { terminals } = await hc(io, ["ls", "--json", "--label", label]);
+  return Promise.all(terminals.filter(row => row.state === "live" && !row.address.includes("/"))
     .map(row => hc(io, ["get", row.address, "--json"])));
-  const live = rows.filter(row => row.state === "live" && row.labels?.["projects.session"] === id);
-  const running = live.find(row => statusWord(row.status));
-  if (running) return { state: "running", status: statusWord(running.status), terminal: running, live };
-  const starting = live.find(row => Date.now() - row.created_ms < STARTING);
-  if (starting) return { state: "starting", terminal: starting, live };
-  return { state: "stopped", live };
+}
+
+export async function observe(io, id) {
+  return classify(await details(io, `projects.session=${id}`), id);
 }
