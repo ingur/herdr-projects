@@ -24,7 +24,6 @@ Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://
 
 | Command | |
 | --- | --- |
-| `/projects` | status |
 | `/projects new [name]` | turn this session into a project |
 | `/projects resume [name]` | open a stopped project in this terminal |
 

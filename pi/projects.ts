@@ -2,12 +2,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { describeError, renameSchema, sendSchema, startSchema, targetSchema } from "../core/contracts.ts";
 import { toolDescriptions } from "./prompts.mjs";
+import { listThreads } from "./pi-catalog.mjs";
 import { createSessionRuntime } from "./session.ts";
 import { renameThread, reopenThread, resolveThread, sendThread, startThread } from "./threads.ts";
-import { listThreads, statusText } from "./pi-catalog.mjs";
 import { dormantHint } from "./registration.mjs";
 import { resumeProject } from "./resume.ts";
-import { waitingDelivery } from "../core/messages.mjs";
 
 function result(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], details: value };
@@ -68,7 +67,7 @@ export default function projects(pi: ExtensionAPI) {
     resume: "resume a stopped project in this terminal",
   };
   pi.registerCommand("projects", {
-    description: "Project status; new [name] makes this conversation a project; resume [name] resumes a stopped project here",
+    description: "new [name] makes this conversation a project; resume [name] resumes a stopped project here",
     getArgumentCompletions: (prefix: string) => {
       const items = Object.entries(verbs).filter(([verb]) => verb.startsWith(prefix)).map(([value, description]) => ({ value, label: value, description }));
       return items.length ? items : null;
@@ -77,23 +76,11 @@ export default function projects(pi: ExtensionAPI) {
       const [verb = ""] = args.trim().split(/\s+/);
       const body = args.trim().slice(verb.length).trim();
       if (verb === "resume") return resumeProject(ctx, body);
-      if (verb && verb !== "new") { ctx.ui.notify(dormantHint, "info"); return; }
+      if (verb !== "new") { ctx.ui.notify(dormantHint, "info"); return; }
       try {
-        if (verb === "new") {
-          const current = await session.promote(ctx, body || undefined);
-          if (current) ctx.ui.notify(`Project ${current.title} uses this conversation (${current.id}).`, "info");
-          return;
-        }
-        if (session.independent()) { ctx.ui.notify(dormantHint, "info"); return; }
-        const r = session.bound(ctx);
-        r.lastInteraction = Date.now();
-        const deliveries = session.reconcileDelivery(r);
-        const waitingMessages = deliveries.filter(item => waitingDelivery(item.delivery)).length;
-        const possiblyUndelivered = deliveries.filter(item => item.delivery.state === "uncertain" && item.delivery.redelivered).length;
-        ctx.ui.notify(statusText(await listThreads(r), waitingMessages, possiblyUndelivered), "info");
-      } catch (error) {
-        ctx.ui.notify(`Projects: ${describeError(error)}`, !verb && session.independent() ? "info" : "error");
-      }
+        const current = await session.promote(ctx, body || undefined);
+        if (current) ctx.ui.notify(`Project ${current.title} uses this conversation (${current.id}).`, "info");
+      } catch (error) { ctx.ui.notify(`Projects: ${describeError(error)}`, "error"); }
     },
   });
 }

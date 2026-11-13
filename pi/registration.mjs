@@ -9,7 +9,7 @@ import { checkedSessionFile } from "./pi-launch.mjs";
 import { clearControlDescriptor } from "../core/control.mjs";
 
 export const PROJECT_TOOLS = ["thread_start", "thread_list", "thread_send", "thread_rename", "thread_resolve", "thread_reopen"];
-export const dormantHint = "Use /projects for status, /projects new [name] to make this conversation a project, or /projects resume [name] to resume one here.";
+export const dormantHint = "Use /projects new [name] to make this conversation a project, or /projects resume [name] to resume one here.";
 
 export function findSessionRecord(stateDir, id) {
   sessionId(id);

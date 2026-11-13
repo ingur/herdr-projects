@@ -249,7 +249,7 @@ uncertain. At the next safe delivery opportunity, an uncertain attempt is
 automatically redelivered exactly once with a short visible transport note that
 it may repeat a message delivered before an interruption. `redelivered: true` is
 persisted before that attempt and retained through receipts; another interrupted
-attempt is never redelivered again and `/projects` reports it as possibly
+attempt is never redelivered again and the session's status line reports it as possibly
 undelivered. A receipt is not completed work; exactly-once execution is not
 claimed. Pi's synchronous append/rollback semantics let visible entries plus an
 existing session file establish durable receipt; the adapter does not reread the
