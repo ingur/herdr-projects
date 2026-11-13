@@ -10,7 +10,7 @@ A project is one Pi session that coordinates. It can start threads: other Pi ses
 pi install git:github.com/ingur/pi-projects
 ```
 
-Needs `hc` (herdr-core). Linux and macOS.
+Needs `hc` (herdr-core) 0.1.20 or newer. Linux and macOS.
 
 ## Use
 
@@ -27,7 +27,7 @@ Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://
 | `/projects new [name]` | turn this session into a project |
 | `/projects resume [name]` | open a stopped project in this terminal |
 
-The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`, `thread_reopen`.
+The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`.
 
 ## Good to know
 

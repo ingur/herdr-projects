@@ -1,281 +1,118 @@
-# Projects adapter contract
+# Projects contract
 
-`@ingur/pi-projects` is an ordinary Pi package. Run plain `pi`; there is no
-launcher, alternate profile, argument filter or bundled subagent extension.
-The tool-neutral lifecycle, registry and transport live in `core/`; `pi/` owns
-Pi registration, launch capture, transcripts, receipts and tools. `core/lib/`
-contains private copies of the small state/process/delivery helpers. No other
-repository or shared package is needed. Herdr is optional; hc is required for
-registered sessions and terminal lifecycle operations.
+hc runs terminals and types text in. `core/` keeps the records and decides who may send what to
+whom, with no agent-specific code. An adapter starts, resumes and deletes one tool's conversations.
 
-## State and normal sessions
+## Records
 
-State defaults to `${XDG_STATE_HOME:-~/.local/state}/pi-projects`.
-`PI_PROJECTS_STATE_DIR` selects one absolute directory; control options can select
-`stateDir` explicitly. State never defaults beside the installed package.
-`Store` uses `stateDir/projects/SHA256(projectRoot)`, with an absolute canonical
-project root and full UUID session IDs. Multiple coordinators may share a root;
-each thread belongs to one coordinator.
+`stateDir` is `options.stateDir`, else `$PI_PROJECTS_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/pi-projects`.
 
-An ordinary session with no record for its Pi UUID is dormant: no footer, notice,
-polling, editor observer or active project tools. `/new`, `/resume` and `/fork`
-remain untouched. `/projects` gives one new/resume hint. `/projects new [name]`
-promotes the current persistent conversation, retaining its UUID, transcript,
-cwd and terminal. Any local hc terminal works; outside one it explains that an
-hc terminal is needed. `herdr.space` and `herdr.tab` are independent optional
-presentation labels, not prerequisites. Sessions without placement launch with
-no Herdr placement labels and remain reachable with `hc attach`. Core retains
-their records; it defines no "Unplaced" UI group.
+```
+<stateDir>/sessions/<id>.json   one record per session
+<stateDir>/locks/<id>           held while launching, registering, delivering or updating it
+<stateDir>/bin/control          written by register: runs core/control.mjs with node
+version: 2
+id, role: "coordinator" | "thread"     id is core's own UUID, never the agent tool's
+coordinator                            its coordinator's id (its own for a coordinator)
+title, titleSource: "placeholder" | "agent" | "user"
+cwd, agent: "pi", resolved, rank, created
+space?, tab?                           Herdr placement, taken from the terminal's labels
+reopenWithProject?: true               threads closed together with their project
+waiting: [{from, title?, id?, text, created}]   mail not yet typed in
+adapter: {}                            owned by the adapter
+```
 
-On every `session_start`, including reload/resume, the adapter looks up the Pi
-session ID across all project records. A match supplies root, role and coordinator;
-no launch-role environment is used. Registration takes both writer locks inside
-the extension. Live or uncertain competing ownership causes a notice and graceful
-Pi shutdown before registration or conversation mutation. Clean shutdown (`quit`,
-Ctrl+D, SIGHUP/SIGTERM) and session replacement (`/new`, `/resume`, `/fork`, or
-`ctx.switchSession`) close the coordinator's live owned thread terminals through
-core's `close-threads` action. The Pi shutdown hook starts the stable control shim
-detached with ignored stdio, so it outlives Pi or its terminal, and awaits it while
-Pi remains alive to serialize replacement. Each verified live thread is marked
-`reopenWithProject: true` before closing; already-stopped or unowned threads are
-not marked. Closing changes neither resolution nor conversation data and sends
-no per-thread closed notices. A crash without clean shutdown cascades nothing.
+Writes go to a dot-file in the same directory, then rename. Updates are read-modify-write under
+the session's lock file, which holds the owner's pid; a lock whose owner died is taken over.
 
-Cleanup deactivates tools, clears status/editor observation, removes this session's
-terminal labels, marks it offline without a process owner, and releases both locks.
-Herdr placement labels stay on the terminal. Pi then loads a fresh extension
-instance, which registers only a matching session UUID. A fork has a new UUID and
-is ordinary, never a second project. `/reload` cleans up and registers again without
-closing threads. No lock is taken by an external launcher or held before Pi's
-trust prompt. This is a cooperative local protocol, not an OS security boundary.
+## Running
 
-Every coordinator registration (sidebar, `/projects resume`, or plain Pi resume)
-uses the existing ensure path to reopen marked, unresolved threads without focus.
-They use the project's current space, or no placement when it has no space.
-The mark is consumed once per thread, including a failed relaunch; failures are
-reported once without blocking the other threads or the project. Individual
-thread opening/registration, resolution and deletion also clear the mark.
+Core asks hc for live terminals labelled `projects.session=<id>`. `running`: one of them reports
+an agent status (`idle`, `working`, `done`, `blocked`, `error`). `starting`: none does yet and
+one was created less than 60 s ago. `stopped`: anything else; a labelled terminal without a
+status after 60 s is a shell left behind, and the next launch removes its `projects.*` labels.
+Before every `hc send` core reads the terminal again; it must carry the label and report a
+status other than `blocked`, so nothing is ever typed into a shell.
 
-`/projects resume [name]` lists stopped Pi coordinators across the state directory,
-excluding this session and live/uncertain writers. Existing observation,
-registration and creation timestamps order most-recently-used first; resolved
-projects come last. The native filterable picker shows title and folder. A unique
-case-insensitive exact title, otherwise a unique substring, opens directly;
-other text pre-filters the picker. Opening switches to the validated recorded
-conversation in this terminal and registers its current space/tab (or neither).
-Pi rebuilds its runtime and tools in the conversation's own cwd, including across
-folders; a fresh replacement context announces that folder when it differs from
-the terminal's launch directory. Unwritten conversations are explained with the
-UUID/folder needed to start them; no transcript or new identity is fabricated.
+## Messages
 
-## Schema version 1
+```
+<message from="coordinator|thread" title="TITLE" id="SESSION-ID">
+TEXT
+</message>
+```
 
-Records, pause controls, deliveries and message envelopes carry `version: 1`.
-There is no migration; incompatible stored versions are rejected, not rewritten.
-Required record fields:
+From the user it is `<message from="user">`. `&`, `"`, `<`, `>` in attribute values are escaped.
+Text is 1 to 100000 characters. `send {to, from?, text}` (`from` absent means the user):
 
-- `version`, `id`, `projectRoot`, `title`, `titleSource` (`placeholder`, `agent`, `human`).
-- `agent` (currently `pi`), `role` (`coordinator` or `thread`), `coordinator` (self for coordinators).
-- `cwd`, `registration` (`awaiting-extension`, `registered`, `offline`).
+1. A resolved thread is reopened when its coordinator or the user sends; others are refused.
+2. `running`: `blocked` types and stores nothing (`sent: false`). Otherwise hc types it; when the
+   recipient was `idle` or `done` and no turn started, the note says so.
+3. `starting`: wait up to 30 s for `running`, then as 2, else as 4 or 5.
+4. A stopped thread: the message joins `waiting`, the thread is launched, waiting mail goes out.
+5. A stopped coordinator: the message joins `waiting`. Only the user resumes a project.
 
-Optional lifecycle/binding fields:
+Waiting mail goes out (after `send` launched a thread, after `create-thread`, at every
+`register`) once the session reports a status within 60 s: in order, each removed once hc took it.
 
-- `space`, `tab`, `terminal`, `resolved`, `resolvedBy: {kind: "human"|"agent", session?}`.
-- `created`, `registered`, `observed`; finite `rank` defaults to creation milliseconds.
-- `launchState`: `claimed`, `requested`, `observed`, `registered`, `failed`, `unknown`;
-  `launchToken`, `launchBoot`, `launchError`.
-- `owner`: PID, platform start time, boot identity, process state and lock token.
-- `initial`: message held until its recipient registers.
-- Pi's observed `sessionFile`, `sessionDir`, and `transcriptState` (`expected` or `unwritten`).
-- `reopenWithProject`: a thread closed with its coordinator awaits one reopening.
+## Actions
 
-Transcripts remain in Pi's normal session location and are visible in `/resume`.
-Registration records the file and directory reported by Pi. An unwritten UUID
-may acquire a new filename after restart; an observed transcript is never reset
-to unwritten. Reopen validates header ID/cwd and realpath containment in the
-observed directory. A lost expected transcript refuses empty-context recovery.
-Delete validates the same header and containment and rejects symlinked transcript
-entries; missing files are already removed. It never deletes subagent-package
-state or any unrelated conversation.
+`node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control` and the `pi-projects` bin
+link) prints one JSON object; errors print `projects: message` on stderr and exit 1. The same
+functions are `actions[name](options, io)` in `core/control.mjs`, next to `stateDirectory()`,
+`readRecord(stateDir, id)` and `findRecord(stateDir, predicate)`. `by` is `"user"` or `"agent"`.
 
-Thread names are unique per coordinator. Unnamed creation reserves `New thread`,
-`New thread 2`, etc. Human duplicates receive suffixes; repeated agent names return
-the existing thread without replacing its initial instruction. Agent renames
-cannot replace human titles. Lifecycle notices go only to a thread's coordinator
-and are informational. Order coordinators by descending rank, then their open
-threads, then resolved threads, each by descending rank; equal ranks use UUID.
-Catalogs retain resolved rows and group different project roots first.
+| Action | Options | Does |
+|---|---|---|
+| `list` | `{}` | `{sessions: [view], errors?}`: coordinators by rank, highest first, each followed by its threads, unresolved first, by rank |
+| `register` | `{id?, title?, cwd, agent, adapter, terminal}` | Binds the conversation in an hc terminal; without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another live terminal with a status carries the label. Labels the terminal, saves `adapter`, `cwd` and placement, reopens unresolved `reopenWithProject` threads, delivers waiting mail |
+| `release` | `{id}` | The session leaves its terminal: `projects.*` labels go; a coordinator's running threads are closed and flagged `reopenWithProject` |
+| `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case), at most 80 characters, not `coordinator`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
+| `open` | `{id, space?}` | Launches when stopped; returns once the terminal exists |
+| `send` | `{to, from?, text}` | As above; adds `sent` and `note?` |
+| `rename` | `{id, title, by}` | An agent cannot change a `user` title |
+| `order` | `{id, rank}` | |
+| `place` | `{id, space}` | Only when stopped |
+| `resolve` | `{id, by, from?}` | An agent: only a thread, only from its coordinator, not while `working` (waits up to 20 s for a finishing turn). Then as `close` |
+| `reopen` | `{id}` | Clears `resolved` |
+| `close` | `{id}` | Kills the terminal carrying the label, read again right before the kill; a coordinator first closes its running threads and flags them `reopenWithProject` |
+| `delete` | `{id}` | Closes, removes the conversation through the adapter and the record; a coordinator takes its threads. Prints `{deleted: [ids]}` |
 
-## Adapter obligations and ownership
+Every other action returns the view, with `error` when part of it failed:
+```
+id, role, coordinator, title, titleSource, cwd, agent, resolved, rank, created, space, tab,
+terminal (while running or starting), state: "running" | "starting" | "stopped",
+status (hc's word, only when running), waiting (count), error?
+```
 
-A new adapter must implement the complete boundary, not just supply a command:
+## Launching and labels
 
-1. Add a known runtime kind and lazy launch/removal selection in
-   `core/agent-runtimes.mjs`. `list` must work without loading any adapter files.
-   Loading may be asynchronous; the loaded removal operation runs synchronously
-   under writer, extension and registry locks. Unknown kinds fail closed.
-2. Use `core/lib/state.mjs`'s exact lock protocol. The running adapter holds
-   `stateDir/writer-locks/<id>` and `projectDir/locks/extension-<id>` for its
-   lifetime, records their process identity, and releases only its own generation.
-   Save an offline observation and clear the process owner on shutdown or
-   replacement before release. Live/unknown owners block recovery and deletion.
-   Incomplete writes get one second of grace; reclamation removes observed
-   filenames, never a racing replacement directory.
-3. Verify the local live hc address. Registered ownership requires the adapter
-   process to descend from hc's terminal PID; project/session labels must not
-   conflict. Before registration, a starting terminal is owned only when its
-   address equals the record's terminal, it is live, and its `projects.session`
-   and `projects.launch` match our launch claim. No pre-registration writer lock
-   is required: this permits showing Pi's native trust prompt.
-4. Register with explicit runtime, role/coordinator/root/cwd and observed placement;
-   missing placement is valid and clears stale labels from the record. Take both
-   locks before registration. Persist through `Store`'s atomic registry operations.
-5. At each registration atomically replace executable `stateDir/bin/control` and
-   `stateDir/bin/pi`, then advertise via `publishControlDescriptor`. It verifies
-   ancestry and writes `projects.session`, `projects.project`, `projects.control`.
-6. Publish `initial` only after the recipient registers. Persist attempts before
-   injection; reconcile receipts honestly. Use `projectDir/inboxes/<id>/<message>.json`,
-   `deliveries/<id>/<message>.json`, and `controls/<id>.json`.
-   Controls are `{version:1, paused, reason?, at?}`; deliveries contain `version:1`,
-   `state`, `execution`, optional attempt time/entry ID, and `redelivered: true`
-   once the automatic second delivery attempt has begun.
-7. Use the copied process helpers. Linux identity is PID + `/proc` start ticks +
-   boot ID. macOS is PID + UTC `ps lstart` second + `kern.bootsessionuuid`; reuse
-   within one second cannot be distinguished without native OS access. Unknown
-   ownership fails closed. Unsupported platforms refuse state creation. Catalogs
-   share one process table per invocation; destructive decisions use fresh reads.
+`hc run --bg --json --no-parent --cwd CWD --name SLUG-ID8 [--label herdr.space=S --label
+herdr.tab=T] --label projects.session=ID --label projects.control=… -- env K=V …
+PROJECTS_SESSION=ID <adapter argv>`. A thread starts in its coordinator's space while that runs,
+else in its recorded space, else unplaced. hc has no rename, so `register` cannot name a
+terminal. A failed `hc run` gives the result an `error`; waiting mail stays.
 
-## Stable commands
+- `projects.session=<id>`: the terminal running that session.
+- `projects.control={"version":2,"command":["<stateDir>/bin/control"],"stateDir":"…"}`.
+- `projects.changed=<ms>`: set after a change, on the session's terminal or its coordinator's.
 
-`projects.control` is exactly
-`{version:1, command:["<stateDir>/bin/control"], stateDir:"<stateDir>"}`.
-It never embeds a versioned Node path. The shims use the captured PATH, explicit
-Pi home/session-dir overrides when present, and `PI_PROJECTS_STATE_DIR`.
+## Adapters
 
-Pi capture prefers `pi` on that PATH only when its resolved executable is this
-Pi entry, or its recognized Nix wrapper execs this exact Node and entry script.
-The profile symlink then follows upgrades without re-registering a stopped
-session. An unrelated PATH Pi is never substituted. Otherwise the fallback is
-this `process.execPath`, `process.execArgv`, and entry script. Explicit `-e`
-extensions are retained with absolute local paths, so local package try-outs
-also propagate to threads. `PI_PROJECTS_PI_COMMAND` is the one command override:
-a JSON argv array beginning with an absolute executable (for example
-`["/absolute/path/to/pi"]`). The control shim uses `node` on the captured PATH,
-falling back to this Node executable only if unavailable. Exact-runtime fallback
-paths can become unavailable after package garbage collection; re-register with
-a working Pi to refresh them.
+`core/adapters.mjs` maps an agent kind to a module exporting `start(record)` (argv for a new
+conversation), `resume(record)` (argv to continue it, or nothing when there is none yet),
+`env(record)` (a short allow-list from `record.adapter`), `inherit(record)` (adapter data a new
+thread of this coordinator starts with) and `remove(record)` (delete the conversation).
 
-On the inspected Nix host, `/etc/profiles/per-user/ingur/bin/pi` resolves to the
-Pi 1.5.2 wrapper, which only edits PATH for Node/clipboard/ripgrep/fd and execs
-its Node 22.23.4 plus `dist/bundle/cli.js`. Capturing the matched profile entry
-preserves those wrapper effects and follows later profile upgrades.
+Pi keeps `{sessionId, sessionFile, command, env}`, `env` limited to `ENV` in `pi/adapter.mjs`.
+`resume` uses `--session FILE` once it exists, else `--session-id ID`; `start` adds `--name TITLE`;
+`inherit` copies only `command` and `env`. `remove` deletes the transcript only when it is a
+regular file inside a Pi sessions directory whose header names `sessionId`.
 
-New sessions launch as `bin/pi --session-id <uuid> --name <title>`; retained
-transcripts use `bin/pi --session <file>`. hc receives `run --bg --json --no-parent
---cwd <cwd>`, optional placement labels, the session/project/launch labels, then
-`--` and that argv. Neither hc's PATH nor a Herdr installation supplies Pi or Node
-selection. A lost hc reply is uncertain, not proof of failed launch. Recovery
-requires dead writers and no live/uncertain terminal carrying the session label.
+## Known limits
 
-## Control API and UI boundary
-
-Run `pi-projects ACTION '<JSON options>'`, `node core/control.mjs ACTION ...`,
-or the advertised control shim. Success prints one JSON value; failures use
-stderr/nonzero exit. Every action accepts `stateDir?`; session actions require
-`projectRoot` and exact `id`. These local commands and attribution fields are not
-an authentication boundary.
-
-- `list {projectRoot?}` returns sessions and observation errors, without mutation.
-- `create {projectRoot,title,space?,agent?}` reserves a coordinator and ensures it.
-- `create-thread {projectRoot,id:coordinator,title?,by?,cwd?,initial?}` reserves a
-  thread and ensures it. `by` defaults to agent; `cwd` accepts absolute or
-  project-relative directories, including outside the project.
-- `ensure` and `show {projectRoot,id,space?}` recover only the same conversation.
-  Live sessions ignore requested placement. Stopped threads follow their
-  coordinator's verified live or current recorded placement, including no space
-  after an unplaced registration; others retain their own. A placed session gets
-  a tab ID if missing. `show` returns `readyToFocus`; the caller, not core, focuses
-  it. Neither operation resumes paused work.
-- `place {projectRoot,id,space}` rehomes only a stopped session; uncertain/live
-  ownership blocks it. No launch, terminal move or child-record rewrite.
-- `rename {projectRoot,id,title,by?}` defaults to human authorship. `order
-  {projectRoot,id,rank}` persists a finite numeric rank. Neither launches work.
-- `send {projectRoot,id,text,note?,sender:{kind,title,session?}}` publishes durably.
-  Thread recipients are ensured; recovery failure does not discard the message.
-  Coordinator recipients are never launched by sends, including human-kind sends.
-  A stopped coordinator returns accepted-and-waiting (`availability.waiting: true`);
-  delivery waits until the human resumes the project. Text/note limits are
-  1–100000 characters. Agent sends to resolved threads require explicit reopen;
-  human sends clear resolution but do not launch a stopped coordinator.
-- `close {projectRoot,id}` kills only verified owned terminals, retaining
-  transcripts, registry and inboxes. A coordinator first runs `close-threads`.
-  Closing a terminal also stops its running subagents; unrelated live shells are
-  never killed.
-- `close-threads {projectRoot,id:coordinator}` closes all of that coordinator's
-  verified live owned threads, marking them `reopenWithProject: true`. Stopped or
-  unowned threads are left alone; no resolution, deletion or lifecycle notices.
-  Returns `{closed:[threadIds]}`. Failures are collected after attempting the other
-  threads and reported as an error. Repeated calls leave already-closed threads alone.
-- `delete {projectRoot,id}` is not exposed as an agent tool (not access-controlled).
-  It closes verified live terminals, waits for dead writers, takes all locks,
-  deletes the validated conversation and transport, then removes the record last.
-  Coordinator deletion includes its threads, in UUID order before the coordinator.
-  A failed cascade reports already-deleted IDs and retains the failing record.
-- `resolve` and `reopen {projectRoot,id,by?,session?}` set/clear organizational
-  resolution; `by` defaults to human. Agent calls refuse coordinator targets.
-  Reopen ensures availability but does not replay an interrupted turn or clear pause.
-
-Session views include identity/title/role/coordinator/agent/cwd, optional space/tab/
-terminal, resolved/rank/registration/writer/paused/terminalState/terminalOwned/
-launchState, optional created/registered/observed timestamps, and optional error.
-The Herdr sidebar depends only on the descriptor
-and actions, not registry files. `projects.project` is the project-root hash;
-`projects.launch` is a unique launch token. `projects.rank` is UI-owned for
-independent terminals only. Core records no UI grouping for missing placement;
-the sidebar lists only sessions belonging to an existing space, retaining all
-records, conversations and threads when their space is gone.
-
-## Delivery and Pi composition
-
-Envelopes are `{version:1,id,projectRoot,recipient,created,sender,author,text,
-source?,via:[],note?,informational?}`. Authors contain `kind,title,session?,role?,type?`;
-source references contain `session,entry?,toolCall?`; forwarding adds attributed
-hops while preserving exact text and original authorship. Attachment-bearing
-entries cannot be forwarded as if they were text. Publication is idempotent only
-for identical ID/content; conflicting content is rejected.
-
-Delivery distinguishes pending, attempting, visible-not-durable, recorded and
-uncertain. At the next safe delivery opportunity, an uncertain attempt is
-automatically redelivered exactly once with a short visible transport note that
-it may repeat a message delivered before an interruption. `redelivered: true` is
-persisted before that attempt and retained through receipts; another interrupted
-attempt is never redelivered again and the session's status line reports it as possibly
-undelivered. A receipt is not completed work; exactly-once execution is not
-claimed. Pi's synchronous append/rollback semantics let visible entries plus an
-existing session file establish durable receipt; the adapter does not reread the
-transcript on every tick.
-
-Project messages, including initial instructions and queued inbox messages, wake
-normally after start, reopen and reload; no first human prompt is required.
-Delivery still requires a selected model and a quiet idle boundary: no draft,
-pending input, open prompt, active turn or pause. Opening a session never clears
-an existing abort pause. Esc/Ctrl+C while idle pauses nothing; an aborted settled
-run pauses delivery until the human's next prompt. Informational notices never
-request turns. Replayed subagent completions follow
-the separate subagent extension's wake policy; `/reload` stops its running children.
-
-Tools (`thread_start`, `thread_list`, `thread_send`, `thread_rename`,
-`thread_resolve`, `thread_reopen`) register with `defaultActive:false` and activate
-only after registration, preserving other tools. The only commands are `/projects`
-(status, including this session's waiting-message count), `/projects new [name]`,
-and `/projects resume [name]`. Unknown words show the one-line usage hint; there
-are no aliases or delivery-control commands. Native `/name` is human-authored.
-Human prompts reopen resolved sessions; after a human turn, only a thread resolved
-by a different identified agent is reopened. Self/human resolution is retained.
-
-Instructions compose through `before_agent_start.systemPromptOptions.sections`.
-The editor observer wraps/restores the previous editor and shares
-`Symbol.for("pi.extensions.editor-observer")` with pi-subagents. When focus cannot
-be observed it reports that limitation; the remaining human-interaction gates
-still apply. `typebox` and the Pi host packages are peer dependencies supplied by
-Pi's extension loader, not bundled private copies.
+- Messages are typed text by convention, not a security boundary.
+- A picker open in the agent swallows a message; when the agent was working this is silent.
+- A draft left untouched for 60 s stops holding messages (hc's `draft_wait`).
+- A tool that asks a startup question reports no status until it is answered; mail waits.
+- Requires hc 0.1.20 or newer.

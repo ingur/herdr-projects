@@ -1,0 +1,35 @@
+#!/bin/sh
+# By hand after an hc or Pi update: two Pi sessions on an isolated hc core, registered through
+# control, exchange one message each way. Needs pi, jq and hc 0.1.20+ (HC_DIR when `hc` is older).
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+have=$(hc --version | cut -d' ' -f2)
+if [ "$(printf '%s\n' 0.1.20 "$have" | sort -V | head -n 1)" != 0.1.20 ]; then
+  PATH="${HC_DIR:?hc $have is older than 0.1.20; set HC_DIR to a newer hc bin directory}:$PATH"
+fi
+unset HC_TERMINAL_ID HC_TERMINAL_SOCKET
+export HC_SESSION=pp-smoke PI_CODING_AGENT_DIR="$repo/.state/pi"
+work=$(cd "$(mktemp -d)" && pwd -P)
+export PI_PROJECTS_STATE_DIR="$work/state"
+transcripts="$PI_CODING_AGENT_DIR/sessions/--$(printf %s "${work#/}" | tr / -)--"
+trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$work" "$transcripts"' EXIT
+
+adapter=$(jq -nc --arg dir "$PI_CODING_AGENT_DIR" --arg path "$PATH" '{command: ["pi", "--no-extensions"], env: {PI_CODING_AGENT_DIR: $dir, PATH: $path}}')
+control() { node "$repo/core/control.mjs" "$@"; }
+register() { control register "$(jq -nc --arg cwd "$work" --arg t "$1" --argjson a "$adapter" "{cwd: \$cwd, agent: \"pi\", terminal: \$t, adapter: \$a} + $2")"; }
+send() {
+  result=$(control send "$(jq -nc --arg to "$1" --arg from "$2" '{to: $to, from: $from, text: "Reply with the single word ok. Do not use tools."}')")
+  printf '%s\n' "$result" | jq -e .sent >/dev/null || { echo "smoke: not sent: $result" >&2; exit 1; }
+  hc wait --timeout 180 "$3" >/dev/null
+  [ "$(hc get "$3" --json | jq .turn)" -gt 0 ] || { echo "smoke: no turn in $3" >&2; exit 1; }
+}
+
+t1=$(hc run --bg --json --no-parent --cwd "$work" -- env PATH="$PATH" PI_CODING_AGENT_DIR="$PI_CODING_AGENT_DIR" pi --no-extensions | jq -r .address)
+coordinator=$(register "$t1" '{title: "Smoke"}' | jq -r .id)
+thread=$(control create-thread "$(jq -nc --arg c "$coordinator" '{coordinator: $c, title: "helper", by: "user"}')")
+t2=$(printf '%s\n' "$thread" | jq -r .terminal)
+thread=$(printf '%s\n' "$thread" | jq -r .id)
+register "$t2" "$(jq -nc --arg id "$thread" '{id: $id}')" >/dev/null
+send "$thread" "$coordinator" "$t2"
+send "$coordinator" "$thread" "$t1"
+echo "smoke: ok"

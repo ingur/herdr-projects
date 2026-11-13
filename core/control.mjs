@@ -1,583 +1,383 @@
 #!/usr/bin/env node
-import { createHash, randomUUID } from "node:crypto";
-import { readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { bootIdentity, descendsFrom, ownerState, processTable } from "./lib/process.mjs";
-import { agentKind, conversationRemover, sessionLaunchCommand } from "./agent-runtimes.mjs";
-import { Store, stateDirectory } from "./store.mjs";
-import { acquireLock, checkedStatePath, lockState, readJSON, sessionId } from "./lib/state.mjs";
-import { shouldReopen } from "./messages.mjs";
-import { LOCAL_TERMINAL, command, localPlacement, ownership, rejectedLaunch, terminal, terminalPlacement, terminals } from "./hc.mjs";
+import { adapter, agents } from "./adapters.mjs";
+import { hc, observe, statusWord } from "./hc.mjs";
+import { findRecord, locked, readRecord, readRecords, removeRecord, rewrite, stateDirectory, update, writeExecutable, writeRecord } from "./store.mjs";
 
+export { findRecord, readRecord, stateDirectory };
+
+const STORED = {
+  coordinator: "stored; it goes out when the user resumes the project",
+  thread: "stored; it goes out when the thread starts",
+};
+const UNLABEL = ["projects.session=", "projects.control=", "projects.changed="];
 const errorText = error => error instanceof Error ? error.message : String(error);
+const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+const descriptor = stateDir => JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir });
 
-function printable(value, label) {
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value)) throw new Error(`${label} must be nonempty printable text`);
-  return value;
-}
-function validateRecord(record) {
-  if (!record || typeof record !== "object") throw new Error("Missing session record");
-  if (record.version !== 1) throw new Error("Unsupported session record version");
-  sessionId(record.id); sessionId(record.coordinator);
-  if (!["coordinator", "thread"].includes(record.role) || (record.role === "coordinator") !== (record.id === record.coordinator)) throw new Error("Invalid session role/coordinator");
-  printable(record.title, "title");
-  if (record.space !== undefined) localPlacement(record.space, "space");
-  if (!["placeholder", "agent", "human"].includes(record.titleSource)) throw new Error("Invalid title source");
-  if (record.tab !== undefined) localPlacement(record.tab, "tab");
-  if (!isAbsolute(record.projectRoot || "") || !isAbsolute(record.cwd || "") || typeof record.registration !== "string") throw new Error("Invalid session project/cwd/registration");
-  if (record.terminal !== undefined && !LOCAL_TERMINAL.test(record.terminal)) throw new Error("Invalid local terminal identity");
-  if (record.resolved !== undefined && typeof record.resolved !== "boolean") throw new Error("Invalid resolved state");
-  if (record.reopenWithProject !== undefined && typeof record.reopenWithProject !== "boolean") throw new Error("Invalid reopen-with-project state");
-  if (record.rank !== undefined && !Number.isFinite(record.rank)) throw new Error("Invalid session rank");
-  if (record.transcriptState !== undefined && !["expected", "unwritten"].includes(record.transcriptState)) throw new Error("Invalid transcript state");
-  if (record.resolvedBy !== undefined) {
-    if (!["agent", "human"].includes(record.resolvedBy?.kind)) throw new Error("Invalid resolution author");
-    if (record.resolvedBy.session !== undefined) sessionId(record.resolvedBy.session);
-  }
-  printable(record.agent, "agent runtime");
+function session(stateDir, id) {
+  const record = readRecord(stateDir, id);
+  if (!record) throw new Error(`No session ${id}`);
   return record;
 }
-function notice(store, record, action, previousTitle) {
-  if (record.role !== "thread") return;
-  const coordinator = store.record(record.coordinator);
-  if (!coordinator || coordinator.role !== "coordinator") return;
-  const sender = { kind: "system", session: coordinator.id, title: "Projects lifecycle" };
-  store.publish({ version: 1, id: randomUUID(), projectRoot: record.projectRoot, recipient: coordinator.id,
-    created: new Date().toISOString(), sender, author: sender, source: { session: record.id }, via: [],
-    informational: true, text: `Thread ${JSON.stringify(record.title)} (${record.id}) ${action}${previousTitle ? ` from ${JSON.stringify(previousTitle)}` : ""}. Informational only; no action requested.` });
+function threads(stateDir, coordinator) {
+  return readRecords(stateDir).records.filter(record => record.role === "thread" && record.coordinator === coordinator);
 }
-function writerState(stateDir, directory, record, snapshot) {
-  const states = [lockState(join(stateDir, "writer-locks", record.id), snapshot), lockState(join(directory, "locks", `extension-${record.id}`), snapshot)];
-  if (record.owner) states.push(ownerState(record.owner, snapshot));
-  else if (!["awaiting-extension", "offline"].includes(record.registration)) states.push("unknown");
-  return states.includes("live") ? "live" : states.includes("unknown") ? "unknown" : "dead";
+function title(value, role) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed || trimmed.length > 80 || /[\x00-\x1f\x7f]/.test(trimmed)) throw new Error("A title is 1 to 80 printable characters");
+  if (role === "thread" && trimmed.toLowerCase() === "coordinator") throw new Error("A thread cannot be called coordinator");
+  return trimmed;
 }
-function view(stateDir, directory, record, rows, observationError, snapshot) {
-  let paused = false, controlError;
-  try {
-    const control = readJSON(join(directory, "controls", `${record.id}.json`), { version: 1, paused: false });
-    if (control?.version !== 1 || typeof control.paused !== "boolean") throw new Error("Invalid pause control");
-    paused = control.paused;
-  } catch (error) { paused = true; controlError = errorText(error); }
-  const observed = rows?.find(row => row.address === record.terminal);
-  const error = [observationError, controlError, record.launchError].filter(Boolean).join("; ");
+function author(value) {
+  if (value !== "user" && value !== "agent") throw new Error('by must be "user" or "agent"');
+  return value;
+}
+function messageText(value) {
+  if (typeof value !== "string" || !value.length || value.length > 100000) throw new Error("A message is 1 to 100000 characters");
+  return value;
+}
+function space(value) {
+  if (typeof value !== "string" || !value || /[\x00-\x1f\x7f]/.test(value)) throw new Error("space must be a Herdr space id");
+  return value;
+}
+function terminalName(record) {
+  const slug = record.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 23).replace(/-+$/, "");
+  return `${slug ? `${slug}-` : ""}${record.id.slice(0, 8)}`;
+}
+
+const escape = value => value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+export function wrap({ from, title, id, text }) {
+  const sender = from === "user" ? "" : ` title="${escape(title)}" id="${escape(id)}"`;
+  return `<message from="${from}"${sender}>\n${text}\n</message>`;
+}
+
+function view(record, observed, error) {
+  const live = observed?.terminal;
   return {
-    id: record.id, projectRoot: record.projectRoot, title: record.title, role: record.role, coordinator: record.coordinator, agent: record.agent,
-    cwd: record.cwd, space: record.space, tab: record.tab, terminal: record.terminal, resolved: record.resolved ?? false,
-    rank: record.rank ?? (Date.parse(record.created) || 0),
-    created: record.created, registered: record.registered, observed: record.observed,
-    registration: record.registration, writer: snapshot === false ? "unknown" : writerState(stateDir, directory, record, snapshot), paused,
-    terminalState: rows ? observed?.state ?? "not-observed" : "unknown", terminalOwned: snapshot !== false && !!observed && !!ownership(stateDir, directory, record, observed, snapshot), launchState: record.launchState,
+    id: record.id, role: record.role, coordinator: record.coordinator, title: record.title, titleSource: record.titleSource,
+    cwd: record.cwd, agent: record.agent, resolved: record.resolved, rank: record.rank, created: record.created,
+    space: live?.labels["herdr.space"] ?? record.space, tab: live?.labels["herdr.tab"] ?? record.tab,
+    ...(live ? { terminal: live.address } : {}),
+    state: observed?.state ?? "stopped",
+    ...(observed?.status ? { status: observed.status } : {}),
+    waiting: record.waiting.length,
     ...(error ? { error } : {}),
   };
 }
-function open(options) {
-  const stateDir = stateDirectory(options.stateDir);
-  sessionId(options.id);
-  const store = new Store(stateDir, options.projectRoot);
-  const record = validateRecord(store.record(options.id));
-  return { stateDir, store, record };
+
+// projects.changed tells the sidebar to refresh; a terminal that ended meanwhile needs no refresh.
+const mark = (io, address) => hc(io, ["label", address, "--json", `projects.changed=${Date.now()}`]).catch(() => {});
+async function touch(io, id) {
+  const { terminal } = await observe(io, id).catch(() => ({}));
+  if (terminal) await mark(io, terminal.address);
 }
 
-export async function listSessions({ stateDir: selected, projectRoot } = {}, io = {}) {
-  const stateDir = stateDirectory(selected), sessions = [], errors = [], records = [];
-  if (projectRoot !== undefined && (typeof projectRoot !== "string" || !isAbsolute(projectRoot))) throw new Error("projectRoot must be an absolute canonical path");
-  const selectedProject = projectRoot === undefined ? undefined : createHash("sha256").update(projectRoot).digest("hex");
-  let projects;
-  try { projects = readdirSync(join(stateDir, "projects"), { withFileTypes: true }); }
-  catch (error) { if (error.code === "ENOENT") return { sessions }; throw error; }
-  for (const project of projects) {
-    if (!project.isDirectory() || (selectedProject !== undefined && project.name !== selectedProject)) continue;
-    const directory = join(stateDir, "projects", project.name);
-    let names;
-    try { names = readdirSync(join(directory, "records")); }
-    catch (error) {
-      if (error.code !== "ENOENT") errors.push({ project: project.name, error: errorText(error) });
-      continue;
+async function changed(stateDir, id, io, extra = {}) {
+  const record = session(stateDir, id);
+  let observed, error;
+  try { observed = await observe(io, id); } catch (caught) { error = errorText(caught); }
+  if (observed?.terminal) await mark(io, observed.terminal.address);
+  else if (record.role === "thread") await touch(io, record.coordinator);
+  const errors = [extra.error, error].filter(Boolean).join("; ");
+  return { ...view(record, observed), ...extra, ...(errors ? { error: errors } : {}) };
+}
+
+function remember(stateDir, id, row, io) {
+  return update(stateDir, id, record => ({ space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }), io);
+}
+
+async function running(io, id, seconds) {
+  for (let second = 0; ; second++) {
+    const observed = await observe(io, id);
+    if (observed.state === "running" || second >= seconds) return observed;
+    await (io.delay ?? delay)(1000);
+  }
+}
+
+// Reads the terminal right before typing: a shell left behind the label reports no status and is never typed into.
+async function type(io, id, address, message) {
+  const row = await hc(io, ["get", address, "--json"]);
+  const status = statusWord(row.status);
+  if (row.state !== "live" || row.labels?.["projects.session"] !== id || !status) return { sent: false, note: "not typed: the session stopped; send it again" };
+  if (status === "blocked") return { sent: false, note: "not typed: the session is waiting on the user" };
+  const result = await hc(io, ["send", "--json", address, message]);
+  return { sent: true, ...(result.started === false && (status === "idle" || status === "done") ? { note: "typed, but no turn started" } : {}) };
+}
+
+// Types waiting mail in order and removes each message once hc accepted it; the rest stays for the next register.
+async function deliver(stateDir, id, io) {
+  if (!session(stateDir, id).waiting.length) return {};
+  try {
+    const observed = await running(io, id, 60);
+    if (observed.state !== "running") return {};
+    await locked(stateDir, id, async () => {
+      for (let [next] = session(stateDir, id).waiting; next; [next] = session(stateDir, id).waiting) {
+        if (!(await type(io, id, observed.terminal.address, wrap(next))).sent) return;
+        rewrite(stateDir, id, record => ({ waiting: record.waiting.slice(1) }));
+      }
+    }, io);
+    return {};
+  } catch (error) { return { error: errorText(error) }; }
+}
+
+async function launch(stateDir, id, io, place) {
+  try {
+    return await locked(stateDir, id, async () => {
+      const record = session(stateDir, id), observed = await observe(io, id);
+      if (observed.state !== "stopped") return {};
+      for (const row of observed.live) await hc(io, ["label", row.address, "--json", ...UNLABEL]);
+      let target = place ?? record.space;
+      if (place === undefined && record.role === "thread") target = (await observe(io, record.coordinator)).terminal?.labels["herdr.space"] ?? target;
+      const tab = target === undefined ? undefined : record.tab ?? `pt-${id}`;
+      const module = await adapter(record.agent);
+      const argv = module.resume(record) ?? module.start(record);
+      const env = Object.entries(module.env(record)).map(([key, value]) => `${key}=${value}`);
+      await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd, "--name", terminalName(record),
+        ...(target === undefined ? [] : ["--label", `herdr.space=${target}`, "--label", `herdr.tab=${tab}`]),
+        "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`,
+        "--", "env", ...env, `PROJECTS_SESSION=${id}`, ...argv]);
+      rewrite(stateDir, id, () => ({ space: target, tab }));
+      return {};
+    }, io);
+  } catch (error) { return { error: errorText(error) }; }
+}
+
+// hc has no conditional kill: the label is read again right before it.
+async function stop(stateDir, id, io) {
+  const { terminal } = await observe(io, id);
+  if (!terminal) return;
+  const current = await hc(io, ["get", terminal.address, "--json"]);
+  if (current.state !== "live" || current.labels?.["projects.session"] !== id) return;
+  await remember(stateDir, id, current, io);
+  const killed = await hc(io, ["kill", current.address, "--json"]);
+  if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
+}
+
+async function closeThreads(stateDir, coordinator, io) {
+  for (const thread of threads(stateDir, coordinator)) {
+    if (!(await observe(io, thread.id)).terminal) continue;
+    await update(stateDir, thread.id, () => ({ reopenWithProject: true }), io);
+    await stop(stateDir, thread.id, io);
+  }
+}
+
+async function close(stateDir, record, io) {
+  if (record.role === "coordinator") await closeThreads(stateDir, record.id, io);
+  await stop(stateDir, record.id, io);
+}
+
+function writeShim(stateDir) {
+  writeExecutable(join(stateDir, "bin", "control"), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fileURLToPath(import.meta.url))} "$@"\n`);
+}
+
+export const actions = {
+  async list(options = {}, io = {}) {
+    const stateDir = stateDirectory(options.stateDir);
+    const { records, errors } = readRecords(stateDir);
+    const sessions = await Promise.all(records.map(async record => {
+      try { return view(record, await observe(io, record.id)); }
+      catch (error) { return view(record, undefined, errorText(error)); }
+    }));
+    const ranks = new Map(sessions.filter(view => view.role === "coordinator").map(view => [view.id, view.rank]));
+    sessions.sort((a, b) => (ranks.get(b.coordinator) ?? 0) - (ranks.get(a.coordinator) ?? 0) || a.coordinator.localeCompare(b.coordinator) ||
+      Number(a.role === "thread") - Number(b.role === "thread") || Number(a.resolved) - Number(b.resolved) || b.rank - a.rank || a.id.localeCompare(b.id));
+    return { sessions, ...(errors.length ? { errors } : {}) };
+  },
+
+  async register(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir);
+    if (!agents.includes(options.agent)) throw new Error(`No adapter for agent ${JSON.stringify(options.agent)}`);
+    if (typeof options.cwd !== "string" || !isAbsolute(options.cwd)) throw new Error("cwd must be an absolute path");
+    if (!options.adapter || typeof options.adapter !== "object" || Array.isArray(options.adapter)) throw new Error("adapter must be an object");
+    if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name an hc terminal");
+    const promoted = options.id === undefined, id = promoted ? randomUUID() : session(stateDir, options.id).id;
+    if (promoted) {
+      const created = new Date();
+      writeRecord(stateDir, { version: 2, id, role: "coordinator", coordinator: id,
+        title: options.title === undefined ? "New project" : title(options.title, "coordinator"),
+        titleSource: options.title === undefined ? "placeholder" : "user",
+        cwd: options.cwd, agent: options.agent, resolved: false, rank: created.getTime(), created: created.toISOString(), waiting: [], adapter: options.adapter });
     }
-    for (const name of names.filter(name => name.endsWith(".json"))) {
-      try {
-        const record = validateRecord(readJSON(join(directory, "records", name)));
-        if (name !== `${record.id}.json` || createHash("sha256").update(record.projectRoot).digest("hex") !== project.name) throw new Error("Stored session identity/project mismatch");
-        let unavailable;
-        try {
-          if (realpathSync(record.projectRoot) !== record.projectRoot || !statSync(record.projectRoot).isDirectory()) throw new Error("Project is no longer a canonical directory");
-          if (!statSync(record.cwd).isDirectory()) throw new Error("Session cwd is no longer a directory");
-        } catch (error) { unavailable = errorText(error); errors.push({ projectRoot: record.projectRoot, id: record.id, error: unavailable }); }
-        records.push({ directory, record, unavailable });
-      } catch (error) { errors.push({ project: project.name, record: name, error: errorText(error) }); }
-    }
-  }
-  let rows, observationError, snapshot;
-  if (records.length) {
-    try { rows = await terminals(io, new Set(records.map(({ record }) => record.terminal)), true); }
-    catch (error) { observationError = errorText(error); errors.push({ error: observationError }); }
-    if (process.platform === "darwin") {
-      try { snapshot = processTable(); }
-      catch (error) { snapshot = false; observationError = [observationError, errorText(error)].filter(Boolean).join("; "); errors.push({ error: errorText(error) }); }
-    }
-  }
-  for (const { directory, record, unavailable } of records) sessions.push(view(stateDir, directory, record, rows, [unavailable, observationError].filter(Boolean).join("; "), snapshot));
-  const coordinatorRanks = new Map(sessions.filter(session => session.role === "coordinator").map(session => [session.id, session.rank]));
-  sessions.sort((a, b) => a.projectRoot.localeCompare(b.projectRoot) ||
-    (coordinatorRanks.get(b.coordinator) ?? 0) - (coordinatorRanks.get(a.coordinator) ?? 0) ||
-    a.coordinator.localeCompare(b.coordinator) ||
-    Number(a.role === "thread") - Number(b.role === "thread") ||
-    Number(a.resolved) - Number(b.resolved) || b.rank - a.rank || a.id.localeCompare(b.id));
-  return { sessions, ...(errors.length ? { errors } : {}) };
-}
-
-export async function publishControlDescriptor(options, io = {}) {
-  const { stateDir, store, record } = open(options);
-  const observed = terminal(await (io.command ?? command)("hc", ["get", record.terminal, "--json"]));
-  if (observed.address !== record.terminal || observed.state !== "live" || record.registration !== "registered" || !descendsFrom(record.owner, observed.pid)) throw new Error("Cannot advertise an unverified session terminal");
-  const descriptor = { version: 1, command: [join(stateDir, "bin", "control")], stateDir };
-  for (const path of descriptor.command) {
-    if (!isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw new Error("Control descriptor requires absolute printable paths");
-  }
-  const labelled = terminal(await (io.command ?? command)("hc", ["label", record.terminal, "--json",
-    `projects.session=${record.id}`, `projects.project=${store.directory.split("/").pop()}`, `projects.control=${JSON.stringify(descriptor)}`]));
-  if (labelled.address !== record.terminal || labelled.labels?.["projects.control"] !== JSON.stringify(descriptor)) throw new Error("hc did not retain the control descriptor");
-  return descriptor;
-}
-
-export async function clearControlDescriptor(options, io = {}) {
-  const { record } = open(options);
-  const call = io.command ?? command;
-  const observed = terminal(await call("hc", ["get", record.terminal, "--json"]));
-  if (observed.address !== record.terminal || observed.labels?.["projects.session"] !== record.id) return;
-  if (observed.state !== "live") return;
-  if (!descendsFrom(record.owner, observed.pid)) throw new Error("Cannot clear an unverified session terminal");
-  const keys = ["projects.session", "projects.project", "projects.control", "projects.launch"];
-  const cleared = terminal(await call("hc", ["label", record.terminal, "--json", ...keys.map(key => `${key}=`)]));
-  if (cleared.address !== record.terminal || keys.some(key => cleared.labels?.[key] !== undefined)) throw new Error("hc did not clear the session labels");
-}
-
-export async function createCoordinator(options, io = {}) {
-  const stateDir = stateDirectory(options.stateDir);
-  const store = new Store(stateDir, options.projectRoot);
-  const title = printable(options.title, "title"), space = options.space === undefined ? undefined : localPlacement(options.space, "space");
-  const id = randomUUID(), created = new Date();
-  store.transaction(() => store.save(validateRecord({ version: 1, id, projectRoot: options.projectRoot, title, titleSource: "human", role: "coordinator", coordinator: id, agent: agentKind(options.agent ?? "pi"),
-    cwd: options.projectRoot, space, tab: space === undefined ? undefined : `pt-${id}`, resolved: false, registration: "awaiting-extension", launchState: "claimed",
-    created: created.toISOString(), rank: created.getTime() })));
-  return ensureSession({ stateDir, projectRoot: options.projectRoot, id }, io);
-}
-
-export async function createThread(options, io = {}) {
-  const { stateDir, store, record: coordinator } = open(options);
-  if (coordinator.role !== "coordinator") throw new Error("create-thread id must identify a coordinator");
-  const by = options.by === undefined ? "agent" : options.by;
-  if (!["agent", "human"].includes(by)) throw new Error("Create-thread by must be agent or human");
-  const title = options.title === undefined ? "New thread" : printable(options.title, "title").trim();
-  if (title.length > 80 || ["coordinator", "self"].includes(title)) throw new Error("Choose a thread title of at most 80 characters other than coordinator or self");
-  const cwd = realpathSync(options.cwd === undefined ? coordinator.cwd : resolve(coordinator.projectRoot, options.cwd));
-  if (!statSync(cwd).isDirectory()) throw new Error("cwd must be a directory");
-  const id = randomUUID();
-  let initial;
-  if (options.initial !== undefined) {
-    initial = validateEnvelope({ ...options.initial, recipient: id }, coordinator.projectRoot, id);
-    if (initial.informational !== undefined || !initial.text.length || initial.text.length > 100000) throw new Error("Invalid initial message envelope");
-  }
-  let space = coordinator.space;
-  const observed = (await terminals(io, new Set([coordinator.terminal]))).find(row => row.address === coordinator.terminal);
-  if (observed && ownership(stateDir, store.directory, coordinator, observed)) space = terminalPlacement(observed).space;
-  const titleSource = options.title === undefined ? "placeholder" : by;
-  const created = new Date();
-  const guard = acquireLock(join(stateDir, "control-locks", coordinator.id));
-  let claim;
-  try {
-    if (store.record(coordinator.id)?.role !== "coordinator") throw new Error("Coordinator was deleted before thread creation");
-    claim = store.claimThread(validateRecord({ version: 1, id, projectRoot: coordinator.projectRoot, title, titleSource, role: "thread", coordinator: coordinator.id, agent: agentKind(coordinator.agent),
-      cwd, space, tab: space === undefined ? undefined : `pt-${id}`, resolved: false, launchState: "claimed", registration: "awaiting-extension",
-      created: created.toISOString(), rank: created.getTime(), ...(initial ? { initial } : {}) }), { uniqueTitle: options.title === undefined || by === "human" });
-    if (claim.created && initial?.sender.session !== coordinator.id) notice(store, claim.record, "created");
-  } finally { guard.release(); }
-  let availability;
-  try { availability = await ensureSession({ stateDir, projectRoot: coordinator.projectRoot, id: claim.record.id }, io); }
-  catch (error) { availability = { ...view(stateDir, store.directory, claim.record), error: errorText(error) }; }
-  return { ...availability, repeatedName: !claim.created, initialMessage: claim.record.initial?.id };
-}
-
-export async function renameSession(options, io = {}) {
-  const { stateDir, store, record } = open(options);
-  const title = printable(options.title, "title").trim();
-  const by = options.by ?? "human";
-  if (!["agent", "human"].includes(by)) throw new Error("Rename by must be agent or human");
-  if (record.role === "thread" && (title.length > 80 || ["coordinator", "self"].includes(title))) throw new Error("Choose a thread title of at most 80 characters other than coordinator or self");
-  const renamed = store.transaction(() => {
-    const current = validateRecord(store.record(record.id));
-    if (by === "agent" && current.titleSource === "human") throw new Error("This title was chosen by a human; agents cannot rename it");
-    if (current.role === "thread" && store.records().some(other => other.id !== current.id && other.role === "thread" && other.coordinator === current.coordinator && other.title === title)) throw new Error("Another thread in this project already has that title");
-    const next = store.save({ ...current, title, titleSource: by });
-    if (current.title !== title) notice(store, next, "renamed", current.title);
-    return next;
-  });
-  let rows, observationError, current = renamed;
-  try {
-    rows = await terminals(io, new Set([record.terminal]));
-    current = validateRecord(store.record(record.id));
-    const observed = rows.find(row => row.address === current.terminal);
-    if (observed && ownership(stateDir, store.directory, current, observed)) current = store.patch(current.id, terminalPlacement(observed));
-  } catch (error) { observationError = errorText(error); }
-  return view(stateDir, store.directory, current, rows, observationError);
-}
-
-export async function orderSession(options) {
-  if (!Number.isFinite(options.rank)) throw new Error("rank must be a finite number");
-  const { stateDir, store, record } = open(options);
-  const ordered = store.patch(record.id, { rank: options.rank });
-  return view(stateDir, store.directory, ordered);
-}
-
-function discoverLaunch(record) {
-  return record.registration === "awaiting-extension" || ["requested", "unknown"].includes(record.launchState);
-}
-function launchPending(record, rows) {
-  // A prior boot cannot still be starting; current live labels still block a second writer.
-  const expired = record.launchBoot && record.launchBoot !== bootIdentity();
-  return rows.some(row => row.labels?.["projects.session"] === record.id &&
-    (row.state === "live" || !expired && row.state !== "finished"));
-}
-
-export async function placeSession(options, io = {}) {
-  const space = localPlacement(options.space, "space");
-  const { stateDir, store } = open(options);
-  const guard = acquireLock(join(stateDir, "control-locks", options.id));
-  try {
-    const before = store.record(options.id);
-    const rows = await terminals(io, discoverLaunch(before) ? undefined : new Set([before.terminal]), false, discoverLaunch(before) ? before.id : undefined);
-    const placed = store.transaction(() => {
-      const record = validateRecord(store.record(options.id));
-      const observed = rows.find(row => row.address === record.terminal);
-      const writer = writerState(stateDir, store.directory, record);
-      if (observed && ownership(stateDir, store.directory, record, observed) || writer === "live") throw new Error("Session is running; close its terminal before moving it");
-      if (writer !== "dead" || discoverLaunch(record) && launchPending(record, rows)) throw new Error("Session terminal ownership is uncertain; no placement changed");
-      return store.save({ ...record, space });
-    });
-    return view(stateDir, store.directory, placed, rows);
-  } finally { guard.release(); }
-}
-
-export async function ensureSession(options, io = {}) {
-  const { stateDir, store } = open(options);
-  const space = options.space === undefined ? undefined : localPlacement(options.space, "space");
-  let guard;
-  try { guard = acquireLock(join(stateDir, "control-locks", options.id)); }
-  catch (error) {
-    if (error.code !== "ELOCKED") throw error;
-    return { ...view(stateDir, store.directory, store.record(options.id)), pending: true, error: "Another session-control operation owns this session; no launch attempted" };
-  }
-  let rows;
-  const result = (extra = {}) => ({ ...view(stateDir, store.directory, store.record(options.id), rows), ...extra });
-  try {
-    const before = store.record(options.id);
-    if (before.role === "thread" && before.reopenWithProject) store.patch(before.id, { reopenWithProject: undefined });
-    const coordinator = before.role === "thread" && space === undefined ? store.record(before.coordinator) : undefined;
-    const discover = discoverLaunch(before);
     try {
-      rows = await terminals(io, discover ? undefined : new Set([before.terminal, coordinator?.terminal]), false, discover ? before.id : undefined);
-      if (discover && coordinator?.terminal) rows.push(...await terminals(io, new Set([coordinator.terminal]), true));
-    } catch (error) { return result({ pending: true, error: errorText(error) }); }
-    let record = validateRecord(store.record(options.id));
-    const writer = writerState(stateDir, store.directory, record);
-    if (writer !== "dead") {
-      if (record.registration === "registered" && ownerState(record.owner) === "live") return result();
-      return result({ pending: true, error: `${writer} writer ownership; no relaunch performed` });
-    }
-    if (discover && launchPending(record, rows)) {
-      return result({ pending: true, error: "Launch outcome is uncertain or a live terminal still carries this session's label; no relaunch performed" });
-    }
-    const launchCommand = await sessionLaunchCommand(record, stateDir);
-    let targetSpace = space ?? record.space;
-    if (space === undefined && coordinator) {
-      const parent = validateRecord(store.record(coordinator.id));
-      const observed = rows.find(row => row.address === parent.terminal);
-      targetSpace = observed && ownership(stateDir, store.directory, parent, observed) ? terminalPlacement(observed).space : parent.space;
-    }
-    record = { ...record, space: targetSpace, tab: targetSpace === undefined ? undefined : record.tab ?? `pt-${record.id}` };
-    const launchToken = randomUUID();
-    const launchBoot = bootIdentity();
-    const args = ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd,
-      ...(record.space === undefined ? [] : ["--label", `herdr.space=${record.space}`]),
-      ...(record.tab === undefined ? [] : ["--label", `herdr.tab=${record.tab}`]),
-      "--label", `projects.session=${record.id}`, "--label", `projects.project=${store.directory.split("/").pop()}`,
-      "--label", `projects.launch=${launchToken}`,
-      "--", ...launchCommand];
-    const requested = store.transaction(() => {
-      const current = validateRecord(store.record(record.id));
-      if (writerState(stateDir, store.directory, current) !== "dead") return false;
-      store.save({ ...current, space: record.space, tab: record.tab, launchState: "requested", launchToken, launchBoot, launchError: undefined, registration: "awaiting-extension" });
-      return true;
-    });
-    if (!requested) return result({ pending: true, error: "Writer ownership changed during recovery; no launch performed" });
-    let launched;
-    try {
-      launched = terminal(await (io.command ?? command)("hc", args, 15000));
-      const observed = terminal(await (io.command ?? command)("hc", ["get", launched.address, "--json"]));
-      if (observed.address !== launched.address || observed.parent != null || observed.labels?.["projects.session"] !== record.id ||
-        observed.labels?.["projects.project"] !== store.directory.split("/").pop() || observed.labels?.["projects.launch"] !== launchToken ||
-        observed.labels?.["herdr.space"] !== record.space || observed.labels?.["herdr.tab"] !== record.tab) throw new Error("hc launch identity/placement differs from its claim");
-      const current = store.record(record.id);
-      if (current.registration === "registered" && current.terminal !== observed.address) throw new Error("A different terminal registered during launch; ownership requires inspection");
-      store.patch(record.id, { terminal: observed.address, launchState: "observed", launchError: undefined });
-      rows = [...rows.filter(row => row.address !== observed.address), observed];
+      await locked(stateDir, id, async () => {
+        const row = await hc(io, ["get", options.terminal, "--json"]);
+        if (row.state !== "live") throw new Error(`Terminal ${row.address} is not live`);
+        const other = (await observe(io, id)).live.find(live => live.address !== row.address && statusWord(live.status));
+        if (other) throw new Error(`This session is already open in terminal ${other.address}`);
+        await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.control=${descriptor(stateDir)}`]);
+        rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,
+          space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }));
+      }, io);
     } catch (error) {
-      const failed = !launched && rejectedLaunch(error);
-      store.patch(record.id, { launchState: failed ? "failed" : "unknown", launchError: errorText(error) });
-      return result({ pending: !failed, requestedLaunch: launchToken });
+      if (promoted) removeRecord(stateDir, id);
+      throw error;
     }
-    const current = store.record(record.id);
-    return result({ requestedLaunch: launchToken, ...(current.registration === "registered" && ownerState(current.owner) === "live" ? {} : { pending: true }) });
-  } finally { guard.release(); }
-}
+    writeShim(stateDir);
+    const errors = [];
+    for (const thread of threads(stateDir, id).filter(thread => thread.reopenWithProject)) {
+      await update(stateDir, thread.id, () => ({ reopenWithProject: undefined }), io);
+      if (thread.resolved) continue;
+      const { error } = await launch(stateDir, thread.id, io);
+      if (error) errors.push(`${thread.title}: ${error}`);
+    }
+    const { error } = await deliver(stateDir, id, io);
+    if (error) errors.push(error);
+    return changed(stateDir, id, io, errors.length ? { error: errors.join("; ") } : {});
+  },
 
-export async function showSession(options, io = {}) {
-  const ensured = await ensureSession(options, io);
-  const { stateDir, store } = open(options);
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const record = validateRecord(store.record(options.id));
-    if (record.terminal) {
-      const observed = terminal(await (io.command ?? command)("hc", ["get", record.terminal, "--json"]));
-      const current = validateRecord(store.record(options.id));
-      const owned = ownership(stateDir, store.directory, current, observed);
-      if (owned) {
-        const placed = store.patch(current.id, terminalPlacement(observed));
-        if (ensured.requestedLaunch && ensured.requestedLaunch === placed.launchToken) notice(store, placed, "opened");
-        return { ...view(stateDir, store.directory, placed, [observed]), readyToFocus: true, ...(owned === "starting" ? { pending: true } : {}) };
+  async release(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    for (const row of (await observe(io, record.id)).live) {
+      await remember(stateDir, record.id, row, io);
+      await hc(io, ["label", row.address, "--json", ...UNLABEL]);
+    }
+    if (record.role === "coordinator") await closeThreads(stateDir, record.id, io);
+    return changed(stateDir, record.id, io);
+  },
+
+  async "create-thread"(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), coordinator = session(stateDir, options.coordinator);
+    if (coordinator.role !== "coordinator") throw new Error("Threads are created under a coordinator");
+    const by = author(options.by), wanted = options.title === undefined ? undefined : title(options.title, "thread");
+    const text = options.text === undefined ? undefined : messageText(options.text);
+    if (options.cwd !== undefined && typeof options.cwd !== "string") throw new Error("cwd must be a path");
+    const cwd = resolve(coordinator.cwd, options.cwd ?? ".");
+    if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} is not a directory`);
+    const inherited = (await adapter(coordinator.agent)).inherit(coordinator);
+    const { existing, record } = await locked(stateDir, coordinator.id, () => {
+      const siblings = threads(stateDir, coordinator.id), taken = new Set(siblings.map(thread => thread.title.toLowerCase()));
+      const existing = wanted === undefined ? undefined : siblings.find(thread => thread.title.toLowerCase() === wanted.toLowerCase());
+      if (existing && by === "agent") return { existing };
+      if (existing) throw new Error(`A thread called ${existing.title} already exists`);
+      let name = wanted ?? "New thread";
+      for (let number = 2; taken.has(name.toLowerCase()); number++) name = `New thread ${number}`;
+      const created = new Date();
+      return { record: writeRecord(stateDir, { version: 2, id: randomUUID(), role: "thread", coordinator: coordinator.id, title: name,
+        titleSource: wanted === undefined ? "placeholder" : by, cwd, agent: coordinator.agent, resolved: false,
+        rank: created.getTime(), created: created.toISOString(),
+        waiting: text === undefined ? [] : [{ from: "coordinator", title: coordinator.title, id: coordinator.id, text, created: created.toISOString() }],
+        adapter: inherited }) };
+    }, io);
+    if (existing) return changed(stateDir, existing.id, io, { existing: true });
+    const launched = await launch(stateDir, record.id, io);
+    return changed(stateDir, record.id, io, launched.error ? launched : await deliver(stateDir, record.id, io));
+  },
+
+  async open(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    const launched = await launch(stateDir, record.id, io, options.space === undefined ? undefined : space(options.space));
+    const { terminal } = await observe(io, record.id);
+    if (terminal) await remember(stateDir, record.id, terminal, io);
+    return changed(stateDir, record.id, io, launched);
+  },
+
+  async send(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), recipient = session(stateDir, options.to);
+    const sender = options.from === undefined ? undefined : session(stateDir, options.from), text = messageText(options.text);
+    if (recipient.role === "thread" && recipient.resolved) {
+      if (sender && sender.id !== recipient.coordinator) throw new Error("This thread is resolved; only its coordinator or the user can reopen it");
+      await update(stateDir, recipient.id, () => ({ resolved: false }), io);
+    }
+    const message = { from: sender?.role ?? "user", ...(sender ? { title: sender.title, id: sender.id } : {}), text, created: new Date().toISOString() };
+    let observed = await observe(io, recipient.id);
+    if (observed.state === "starting") observed = await running(io, recipient.id, 30);
+    if (observed.state === "running") return changed(stateDir, recipient.id, io, await type(io, recipient.id, observed.terminal.address, wrap(message)));
+    await update(stateDir, recipient.id, record => ({ waiting: [...record.waiting, message] }), io);
+    if (recipient.role === "coordinator") return changed(stateDir, recipient.id, io, { sent: false, note: STORED.coordinator });
+    const launched = await launch(stateDir, recipient.id, io);
+    const { error } = launched.error ? launched : await deliver(stateDir, recipient.id, io);
+    const sent = !session(stateDir, recipient.id).waiting.length;
+    return changed(stateDir, recipient.id, io, { sent, ...(sent ? {} : { note: STORED.thread }), ...(error ? { error } : {}) });
+  },
+
+  async rename(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    const by = author(options.by), name = title(options.title, record.role);
+    await update(stateDir, record.id, current => {
+      if (by === "agent" && current.titleSource === "user") throw new Error("The user chose this title; an agent cannot change it");
+      if (current.role === "thread" && threads(stateDir, current.coordinator).some(thread => thread.id !== current.id && thread.title.toLowerCase() === name.toLowerCase())) {
+        throw new Error(`Another thread is already called ${name}`);
+      }
+      return { title: name, titleSource: by };
+    }, io);
+    return changed(stateDir, record.id, io);
+  },
+
+  async order(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    if (!Number.isFinite(options.rank)) throw new Error("rank must be a number");
+    await update(stateDir, record.id, () => ({ rank: options.rank }), io);
+    return changed(stateDir, record.id, io);
+  },
+
+  async place(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), target = space(options.space);
+    if ((await observe(io, record.id)).state !== "stopped") throw new Error("Close the session before moving it");
+    await update(stateDir, record.id, () => ({ space: target }), io);
+    return changed(stateDir, record.id, io);
+  },
+
+  async resolve(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    if (author(options.by) === "agent") {
+      if (record.role !== "thread" || options.from !== record.coordinator) throw new Error("Only a thread's coordinator can resolve it");
+      // A thread usually reports just before its turn ends; give that turn a moment to finish.
+      for (let second = 0; (await observe(io, record.id)).status === "working"; second++) {
+        if (second >= 20) throw new Error("This thread is still working; wait for its result, then resolve it");
+        await (io.delay ?? delay)(1000);
       }
     }
-    if (attempt < 29) await (io.delay ?? delay)(100);
-  }
-  throw new Error(`Session terminal ownership is not confirmed; no focus performed${ensured.error ? `: ${ensured.error}` : " (launch may still be pending)"}`);
-}
+    await update(stateDir, record.id, () => ({ resolved: true }), io);
+    await close(stateDir, record, io);
+    return changed(stateDir, record.id, io);
+  },
 
-async function closeOwnedSession(stateDir, store, id, io, { deleting = false, withProject = false } = {}) {
-  const record = validateRecord(store.record(id));
-  const discover = discoverLaunch(record);
-  const rows = await terminals(io, discover ? undefined : new Set([record.terminal]), false, discover ? record.id : undefined);
-  const row = rows.find(row => row.address === record.terminal);
-  if (withProject && (!row || !ownership(stateDir, store.directory, record, row))) return { closed: false };
-  if (!row || row.state === "finished" || deleting && !ownership(stateDir, store.directory, record, row)) {
-    if (writerState(stateDir, store.directory, record) !== "dead" || discover && launchPending(record, rows)) throw new Error("Session terminal ownership is uncertain; no terminal killed");
-    return { ...view(stateDir, store.directory, record, rows), closed: true };
-  }
-  const observed = terminal(await (io.command ?? command)("hc", ["get", row.address, "--json"]));
-  const current = validateRecord(store.record(id));
-  if (!ownership(stateDir, store.directory, current, observed)) throw new Error("Session terminal ownership is not confirmed; no terminal killed");
-  store.patch(current.id, { ...terminalPlacement(observed), ...(withProject ? { reopenWithProject: true } : {}) });
-  // hc has no conditional kill: revalidate immediately before its address-only operation.
-  let killed = terminal(await (io.command ?? command)("hc", ["kill", observed.address, "--json"], 15000));
-  for (let attempt = 0; killed.address === observed.address && killed.state === "live" && attempt < 30; attempt++) {
-    await (io.delay ?? delay)(100);
-    killed = terminal(await (io.command ?? command)("hc", ["get", observed.address, "--json"]));
-  }
-  if (killed.address !== observed.address || killed.state !== "finished") throw new Error("hc did not confirm that the owned terminal closed");
-  if (!deleting && !withProject) notice(store, current, "closed");
-  return { ...view(stateDir, store.directory, store.record(id), [killed]), closed: true };
-}
+  async reopen(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    await update(stateDir, record.id, () => ({ resolved: false }), io);
+    return changed(stateDir, record.id, io);
+  },
 
-async function controlLock(stateDir, id, io) {
-  for (;;) {
-    try { return acquireLock(join(stateDir, "control-locks", id)); }
-    catch (error) {
-      if (error.code !== "ELOCKED") throw error;
-      await (io.delay ?? delay)(100);
+  async close(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    await close(stateDir, record, io);
+    return changed(stateDir, record.id, io);
+  },
+
+  async delete(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    const deleted = [];
+    for (const target of record.role === "coordinator" ? [...threads(stateDir, record.id), record] : [record]) {
+      await stop(stateDir, target.id, io);
+      (await adapter(target.agent)).remove(session(stateDir, target.id));
+      removeRecord(stateDir, target.id);
+      deleted.push(target.id);
     }
-  }
-}
-
-export async function closeThreads(options, io = {}) {
-  const { stateDir, store, record } = open(options);
-  if (record.role !== "coordinator") throw new Error("close-threads id must identify a coordinator");
-  const guard = await controlLock(stateDir, `threads-${record.id}`, io);
-  const closed = [], errors = [];
-  try {
-    for (const thread of store.records().filter(child => child.role === "thread" && child.coordinator === record.id).sort((a, b) => a.id.localeCompare(b.id))) {
-      let childGuard;
-      try {
-        childGuard = await controlLock(stateDir, thread.id, io);
-        if ((await closeOwnedSession(stateDir, store, thread.id, io, { withProject: true })).closed) closed.push(thread.id);
-      } catch (error) { errors.push(`${thread.title} (${thread.id}): ${errorText(error)}`); }
-      finally { childGuard?.release(); }
-    }
-  } finally { guard.release(); }
-  if (errors.length) throw new Error(`Could not close project threads: ${errors.join("; ")}`);
-  return { closed };
-}
-
-export async function reopenProjectThreads(options, io = {}) {
-  const { stateDir, store, record } = open(options);
-  if (record.role !== "coordinator") throw new Error("Reopening project threads requires a coordinator");
-  const guard = await controlLock(stateDir, `threads-${record.id}`, io);
-  const errors = [];
-  try {
-    const threads = store.records().filter(child => child.role === "thread" && child.coordinator === record.id && child.reopenWithProject);
-    for (const candidate of threads) {
-      const thread = store.transaction(() => {
-        const current = store.record(candidate.id);
-        return current?.reopenWithProject ? store.patch(current.id, { reopenWithProject: undefined }) : undefined;
-      });
-      if (!thread || thread.resolved) continue;
-      try {
-        const result = await ensureSession({ stateDir, projectRoot: record.projectRoot, id: thread.id }, io);
-        if (result.error) errors.push({ id: thread.id, title: thread.title, error: result.error });
-      } catch (error) { errors.push({ id: thread.id, title: thread.title, error: errorText(error) }); }
-    }
-  } finally { guard.release(); }
-  return { errors };
-}
-
-export async function closeSession(options, io = {}) {
-  const { stateDir, store, record } = open(options);
-  const guard = acquireLock(join(stateDir, "control-locks", options.id));
-  try {
-    if (record.role === "coordinator") await closeThreads(options, io);
-    return await closeOwnedSession(stateDir, store, options.id, io);
-  } finally { guard.release(); }
-}
-
-export async function deleteSession(options, io = {}) {
-  const { stateDir, store, record } = open(options);
-  const guards = [], deleted = [];
-  const lockPath = id => checkedStatePath(stateDir, join(stateDir, "control-locks", id));
-  try {
-    guards.push(acquireLock(lockPath(record.id)));
-    const targets = record.role === "coordinator"
-      ? [...store.records().filter(child => child.role === "thread" && child.coordinator === record.id).sort((a, b) => a.id.localeCompare(b.id)), record]
-      : [record];
-    for (const target of targets) {
-      validateRecord(target);
-      agentKind(target.agent);
-      if (target.id !== record.id) guards.push(acquireLock(lockPath(target.id)));
-    }
-    checkedStatePath(stateDir, join(store.directory, "locks", "registry"));
-    for (const target of targets) {
-      const id = target.id;
-      const paths = [
-        store.inbox(id), join(store.directory, "deliveries", id),
-        join(store.directory, "controls", `${id}.json`), join(store.directory, "records", `${id}.json`),
-      ].map(path => checkedStatePath(stateDir, path));
-      const writer = checkedStatePath(stateDir, join(stateDir, "writer-locks", id));
-      const extension = checkedStatePath(stateDir, join(store.directory, "locks", `extension-${id}`));
-      const removeConversation = await conversationRemover(target.agent);
-      await closeOwnedSession(stateDir, store, id, io, { deleting: true });
-      for (let attempt = 0; writerState(stateDir, store.directory, validateRecord(store.record(id))) !== "dead"; attempt++) {
-        if (attempt === 30) throw new Error(`Session ${id} still has a live or uncertain writer; no conversation deleted`);
-        await (io.delay ?? delay)(100);
-      }
-      const writers = [];
-      try {
-        writers.push(acquireLock(writer));
-        writers.push(acquireLock(extension));
-        store.transaction(() => {
-          const current = validateRecord(store.record(id));
-          removeConversation(current, stateDir);
-          for (const path of paths.slice(0, -1)) rmSync(path, { recursive: true, force: true });
-          if (record.role === "thread") notice(store, current, "deleted");
-          rmSync(paths[paths.length - 1]);
-          deleted.push(id);
-        });
-      } finally { for (const lock of writers.reverse()) lock.release(); }
-    }
+    if (record.role === "thread") await touch(io, record.coordinator);
     return { deleted };
-  } catch (error) {
-    if (deleted.length) throw new Error(`${errorText(error)}; already deleted: ${deleted.join(", ")}`, { cause: error });
-    throw error;
-  } finally { for (const guard of guards.reverse()) guard.release(); }
-}
-
-export async function resolveSession(options) {
-  const { stateDir, store, record } = open(options);
-  const by = options.by ?? "human";
-  if (!["agent", "human"].includes(by)) throw new Error("Resolve by must be agent or human");
-  if (record.role === "coordinator" && by === "agent") throw new Error("Only humans can resolve projects");
-  const resolvedBy = { kind: by, ...(by === "agent" && options.session !== undefined ? { session: sessionId(options.session) } : {}) };
-  const resolved = store.patch(record.id, { resolved: true, resolvedBy, reopenWithProject: undefined });
-  if (!record.resolved) notice(store, resolved, "resolved");
-  return view(stateDir, store.directory, resolved);
-}
-function reopenRecord(store, record) {
-  const reopened = store.patch(record.id, { resolved: false, resolvedBy: undefined, reopenWithProject: undefined });
-  if (record.resolved) notice(store, reopened, "reopened");
-}
-export async function reopenSession(options, io = {}) {
-  const { store, record } = open(options);
-  const by = options.by ?? "human";
-  if (!["agent", "human"].includes(by)) throw new Error("Reopen by must be agent or human");
-  if (record.role === "coordinator" && by === "agent") throw new Error("Only humans can reopen projects");
-  const reopened = store.transaction(() => {
-    const current = validateRecord(store.record(record.id));
-    if (options.afterHumanTurn !== undefined && !shouldReopen(current, sessionId(options.afterHumanTurn))) return false;
-    reopenRecord(store, current);
-    return true;
-  });
-  if (!reopened) return view(stateDirectory(options.stateDir), store.directory, store.record(record.id));
-  return ensureSession(options, io);
-}
-
-function messageText(value, label) {
-  if (typeof value !== "string" || !value.length || value.length > 100000) throw new Error(`${label} must contain 1–100000 characters`);
-  return value;
-}
-function validateEnvelope(value, projectRoot, recipient) {
-  sessionId(value?.id);
-  const optionalText = text => text === undefined || typeof text === "string";
-  const author = item => item && typeof item.kind === "string" && !!item.kind.trim() &&
-    typeof item.title === "string" && !!item.title.trim() && (item.session === undefined || typeof item.session === "string") &&
-    optionalText(item.role) && optionalText(item.type);
-  const source = item => item && typeof item.session === "string" && (item.entry === null || optionalText(item.entry)) && optionalText(item.toolCall);
-  if (value.version !== 1 || value.projectRoot !== projectRoot || value.recipient !== recipient || typeof value.created !== "string" ||
-      typeof value.text !== "string" || !optionalText(value.note) ||
-      (value.informational !== undefined && typeof value.informational !== "boolean") ||
-      !author(value.sender) || !author(value.author) || (value.source !== undefined && !source(value.source)) || !Array.isArray(value.via) ||
-      value.via.some(item => !source(item) || item.sender !== undefined && !author(item.sender) || !optionalText(item.note))) throw new Error("Invalid message envelope");
-  return value;
-}
-
-export async function publishMessage(options, envelope, io = {}) {
-  const { stateDir, store, record } = open(options);
-  const message = validateEnvelope(envelope, record.projectRoot, record.id);
-  if (record.resolved) {
-    if (record.role === "thread" && message.sender.kind === "agent") throw new Error("Thread is resolved; reopen it before sending a message");
-    if (message.sender.kind === "human") reopenRecord(store, record);
-  }
-  store.publish(message);
-  let availability;
-  if (record.role === "coordinator") {
-    const current = store.record(record.id);
-    availability = { ...view(stateDir, store.directory, current), waiting: writerState(stateDir, store.directory, current) !== "live" };
-  } else {
-    try { availability = await ensureSession({ stateDir, projectRoot: record.projectRoot, id: record.id }, io); }
-    catch (error) { availability = { error: errorText(error) }; }
-  }
-  return { message: message.id, recipient: record.id, state: "pending", execution: "not-requested", availability,
-    note: availability.waiting
-      ? "Accepted and waiting in the project inbox until the human resumes the project."
-      : "Persisted in recipient inbox. Availability recovery never overrides human pause; delivery is not task completion." };
-}
-
-export async function sendMessage(options, io = {}) {
-  const sender = { kind: printable(options.sender?.kind, "sender.kind"), title: printable(options.sender?.title, "sender.title"),
-    ...(options.sender?.session === undefined ? {} : { session: sessionId(options.sender.session) }) };
-  const envelope = { version: 1, id: randomUUID(), projectRoot: options.projectRoot, recipient: options.id,
-    created: new Date().toISOString(), sender, author: sender, via: [], text: messageText(options.text, "text"),
-    ...(sender.session ? { source: { session: sender.session } } : {}),
-    ...(options.note === undefined ? {} : { note: messageText(options.note, "note") }) };
-  return publishMessage(options, envelope, io);
-}
+  },
+};
 
 export async function main(argv = process.argv.slice(2)) {
-  const actions = { list: listSessions, create: createCoordinator, "create-thread": createThread, ensure: ensureSession, show: showSession, place: placeSession, rename: renameSession, order: orderSession, send: sendMessage, close: closeSession, "close-threads": closeThreads, delete: deleteSession, resolve: resolveSession, reopen: reopenSession };
-  if (argv.length !== 2 || !Object.hasOwn(actions, argv[0])) throw new Error("Usage: node control.mjs <list|create|create-thread|ensure|show|place|rename|order|send|close|close-threads|delete|resolve|reopen> '<JSON options>'");
-  const options = JSON.parse(argv[1]);
-  if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("Options must be a JSON object");
-  const result = await actions[argv[0]](options);
+  const [name, json] = argv;
+  if (argv.length !== 2 || !Object.hasOwn(actions, name)) throw new Error(`usage: control <${Object.keys(actions).join("|")}> 'JSON options'`);
+  const options = JSON.parse(json);
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("options must be a JSON object");
+  const result = await actions[name](options);
   console.log(JSON.stringify(result));
   return result;
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+
+// Real paths, so the installed `pi-projects` bin link runs main too.
+function invoked() {
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
+if (process.argv[1] && invoked()) {
   main().catch(error => { console.error(`projects: ${errorText(error)}`); process.exitCode = 1; });
 }

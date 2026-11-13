@@ -1,15 +1,23 @@
 import { getSelectListTheme, keyHint, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Container, getKeybindings, Input, SelectList, Text } from "@earendil-works/pi-tui";
-import { listSessions } from "../core/control.mjs";
-import { LOCAL_TERMINAL } from "../core/hc.mjs";
-import { canonicalPath } from "../core/lib/state.mjs";
-import { stateDirectory } from "../core/store.mjs";
-import { describeError, type ThreadRecord } from "../core/contracts.ts";
-import { findSessionRecord } from "./registration.mjs";
-import { launchCwd } from "./pi-launch.mjs";
-import { changedWorkingFolder, displayFolder, matchProject, projectCandidates, projectConversation } from "./resume.mjs";
+import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { sep } from "node:path";
+import { actions, readRecord, stateDirectory } from "../core/control.mjs";
 
-type Project = Pick<ThreadRecord, "id" | "title" | "cwd" | "resolved">;
+type Project = { id: string; title: string; cwd: string; resolved: boolean };
+
+function displayFolder(folder: string, home = homedir()) {
+  return folder === home ? "~" : folder.startsWith(`${home}${sep}`) ? `~${folder.slice(home.length)}` : folder;
+}
+
+function matchProject(candidates: Project[], text: string) {
+  const query = text.trim().toLowerCase();
+  if (!query) return undefined;
+  const exact = candidates.filter(row => row.title.toLowerCase() === query);
+  const matches = exact.length ? exact : candidates.filter(row => row.title.toLowerCase().includes(query));
+  return matches.length === 1 ? matches[0] : undefined;
+}
 
 function pickProject(ctx: ExtensionCommandContext, candidates: Project[], query: string) {
   return ctx.ui.custom<Project | undefined>((tui, theme, _kb, done) => {
@@ -44,27 +52,25 @@ function pickProject(ctx: ExtensionCommandContext, candidates: Project[], query:
   });
 }
 
+// Switching starts a fresh Pi session; its session_start registers the project in this terminal.
 export async function resumeProject(ctx: ExtensionCommandContext, query: string) {
   let file: string;
   try {
-    if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("Resuming a project requires interactive Pi.");
-    if (!LOCAL_TERMINAL.test(process.env.HC_TERMINAL_ID ?? "")) throw new Error("Open an hc terminal and run /projects resume there.");
-    const stateDir = stateDirectory();
-    const catalog = await listSessions({ stateDir });
-    const candidates = projectCandidates(catalog.sessions, ctx.sessionManager.getSessionId());
+    const { sessions } = await actions.list({});
+    const candidates: Project[] = sessions.filter(view => view.agent === "pi" && view.role === "coordinator" && view.state === "stopped")
+      .sort((a, b) => Number(a.resolved) - Number(b.resolved));
     if (!candidates.length) { ctx.ui.notify("No projects to resume.", "info"); return; }
     const selected = matchProject(candidates, query) ?? await pickProject(ctx, candidates, query);
     if (!selected) return;
-    const record = findSessionRecord(stateDir, selected.id);
-    if (!record) throw new Error("This project no longer exists.");
-    file = projectConversation(record);
+    file = readRecord(stateDirectory(), selected.id)?.adapter?.sessionFile;
+    if (!file || !existsSync(file)) throw new Error("This project has no saved conversation yet.");
   } catch (error) {
-    ctx.ui.notify(`Projects: ${describeError(error)}`, "error");
+    ctx.ui.notify(`Projects: ${error instanceof Error ? error.message : String(error)}`, "error");
     return;
   }
-  // Replacement invalidates this closure's ctx and pi; only the fresh callback may touch Pi.
-  return ctx.switchSession(file, { withSession: async fresh => {
-    const folder = changedWorkingFolder(canonicalPath(fresh.cwd), canonicalPath(launchCwd));
-    if (folder) fresh.ui.notify(`This project is now working in ${folder}.`, "info");
+  // Replacement invalidates this ctx; only the fresh one may touch Pi.
+  await ctx.switchSession(file, { withSession: async fresh => {
+    const folder = realpathSync(fresh.cwd);
+    if (folder !== process.cwd()) fresh.ui.notify(`This project is now working in ${displayFolder(folder)}.`, "info");
   } });
 }
