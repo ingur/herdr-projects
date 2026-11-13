@@ -52,12 +52,7 @@ export async function resumeProject(ctx: ExtensionCommandContext, query: string)
     const stateDir = stateDirectory();
     const catalog = await listSessions({ stateDir });
     const candidates = projectCandidates(catalog.sessions, ctx.sessionManager.getSessionId());
-    if (!candidates.length) {
-      const open = catalog.sessions.filter(row => row.role === "coordinator" && row.id !== ctx.sessionManager.getSessionId());
-      const names = open.map(row => row.title).join(", ");
-      ctx.ui.notify(open.length ? `Nothing to resume: ${names} ${open.length > 1 ? "are" : "is"} already open in another terminal.` : "There are no projects yet. Use /projects new [name].", "info");
-      return;
-    }
+    if (!candidates.length) { ctx.ui.notify("No projects to resume.", "info"); return; }
     const selected = matchProject(candidates, query) ?? await pickProject(ctx, candidates, query);
     if (!selected) return;
     const record = findSessionRecord(stateDir, selected.id);
