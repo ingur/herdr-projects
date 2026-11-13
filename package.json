@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Persistent project conversations and threads for Pi and hc",
   "type": "module",
+  "license": "MIT",
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./pi/projects.ts"] },
   "bin": { "pi-projects": "./core/control.mjs" },
