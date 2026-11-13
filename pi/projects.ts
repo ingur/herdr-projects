@@ -19,9 +19,9 @@ const message = (error: unknown) => error instanceof Error ? error.message : Str
 
 // How this Pi was started, so its threads start the same way.
 function piCommand() {
-  const override = process.env.PI_PROJECTS_PI_COMMAND;
+  const override = process.env.PROJECTS_PI_COMMAND;
   const command = override ? JSON.parse(override) : [process.execPath, ...process.execArgv, ...(process.argv[1] ? [resolve(process.argv[1])] : [])];
-  if (!Array.isArray(command) || !command.length || command.some(arg => typeof arg !== "string")) throw new Error("PI_PROJECTS_PI_COMMAND must be a JSON array of strings.");
+  if (!Array.isArray(command) || !command.length || command.some(arg => typeof arg !== "string")) throw new Error("PROJECTS_PI_COMMAND must be a JSON array of strings.");
   for (let i = 2; i < process.argv.length; i++) {
     if (process.argv[i] !== "-e" && process.argv[i] !== "--extension") continue;
     const extension = process.argv[++i];

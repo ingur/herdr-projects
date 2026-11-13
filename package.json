@@ -1,5 +1,5 @@
 {
-  "name": "@ingur/pi-projects",
+  "name": "@ingur/herdr-projects",
   "version": "0.1.0",
   "description": "Persistent project conversations and threads for Pi and hc",
   "type": "module",

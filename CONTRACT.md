@@ -5,7 +5,7 @@ whom, with no agent-specific code. An adapter starts, resumes and deletes one to
 
 ## Records
 
-`stateDir` is `options.stateDir`, else `$PROJECTS_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/projects`.
+`stateDir` is `options.stateDir`, else `$PROJECTS_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/herdr-projects`.
 
 ```
 <stateDir>/sessions/<id>.json   one record per session

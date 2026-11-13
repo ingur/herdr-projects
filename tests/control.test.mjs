@@ -11,7 +11,7 @@ import { remove } from "../pi/adapter.mjs";
 const DEAD = 2 ** 31 - 1; // above any pid_max, so no process has it
 
 function fixture(t) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-projects-")));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-projects-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const stateDir = join(root, "state"), cwd = join(root, "work"), agentDir = join(root, "pi");
   mkdirSync(cwd); mkdirSync(join(agentDir, "sessions", "--work--"), { recursive: true });

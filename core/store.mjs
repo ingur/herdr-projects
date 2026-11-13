@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LOCK_WAIT = 120_000;
 
-export function stateDirectory(value = process.env.PROJECTS_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "projects")) {
+export function stateDirectory(value = process.env.PROJECTS_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "herdr-projects")) {
   if (typeof value !== "string" || !isAbsolute(value)) throw new Error("stateDir must be an absolute path");
   return resolve(value);
 }

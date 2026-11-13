@@ -2,5 +2,5 @@
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 export PI_CODING_AGENT_DIR="$repo/.state/pi"
-export PROJECTS_STATE_DIR="$repo/.state/pi-projects"
+export PROJECTS_STATE_DIR="$repo/.state/herdr-projects"
 exec pi -e "$repo" "$@"

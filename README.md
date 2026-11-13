@@ -1,13 +1,13 @@
-# pi-projects
+# herdr-projects
 
-Long-running projects for [Pi](https://pi.dev) in [herdr](https://herdr.dev) terminals.
+A [Pi](https://pi.dev) extension for long-running projects in [herdr](https://herdr.dev) terminals.
 
 A project is one Pi session that coordinates. It can start threads: other Pi sessions that keep running on their own, that you can open and talk to directly, and that report back.
 
 ## Install
 
 ```sh
-pi install git:github.com/ingur/pi-projects
+pi install git:github.com/ingur/herdr-projects
 ```
 
 Needs `hc` (herdr-core) 0.1.20 or newer. Linux and macOS.
@@ -36,13 +36,13 @@ The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `threa
 - A report to a closed project waits until you resume it.
 - Write in a resolved thread to reopen it.
 - Only you can delete.
-- State lives in `~/.local/state/projects`. Nothing is written into your repo.
+- State lives in `~/.local/state/herdr-projects`. Nothing is written into your repo.
 
 ## Update, remove
 
 ```sh
 pi update --extensions
-pi remove git:github.com/ingur/pi-projects
+pi remove git:github.com/ingur/herdr-projects
 ```
 
 ## Develop
