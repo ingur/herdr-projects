@@ -71,8 +71,18 @@ export default function projects(pi: ExtensionAPI) {
     },
   });
 
+  const verbs = {
+    init: "turn this conversation into a project",
+    open: "open a stopped project in this terminal",
+    resume: "let waiting messages in again after an abort",
+    retry: "deliver one uncertain message again",
+  };
   pi.registerCommand("projects", {
     description: "Projects: init, open, status, resume, retry",
+    getArgumentCompletions: (prefix: string) => {
+      const items = Object.entries(verbs).filter(([verb]) => verb.startsWith(prefix)).map(([value, description]) => ({ value, label: value, description }));
+      return items.length ? items : null;
+    },
     handler: async (args, ctx) => {
       const [verb = ""] = args.trim().split(/\s+/);
       const body = args.trim().slice(verb.length).trim();
