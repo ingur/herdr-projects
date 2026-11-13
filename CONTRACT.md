@@ -115,6 +115,8 @@ regular file inside a Pi sessions directory whose header names `sessionId`.
 - Messages are typed text by convention, not a security boundary. If one ever reached a shell,
   its first line fails, but later lines of a multi-line message would run.
 - After a hard kill, another process that gets the same pid makes the terminal look alive.
+- The pid check needs control, hc and the agents in one process namespace: same machine, no
+  container or sandbox between them.
 - A picker open in the agent swallows a message; when the agent was working this is silent.
 - A draft left untouched for 60 s stops holding messages (hc's `draft_wait`).
 - A tool that asks a startup question reports no status until it is answered; mail waits.

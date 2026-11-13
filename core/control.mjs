@@ -104,7 +104,8 @@ async function running(io, id, seconds) {
 async function type(io, id, address, message) {
   const row = await hc(io, ["get", address, "--json"]);
   const status = statusWord(row.status);
-  if (!holds(row, id) || !status) return { held: "starting" };
+  if (!holds(row, id)) return { held: "stopped" };
+  if (!status) return { held: "starting" };
   if (status === "blocked") return { held: "blocked" };
   const result = await hc(io, ["send", "--json", address, message]);
   return result.started === false && (status === "idle" || status === "done") ? { note: "typed, but no turn started" } : {};
@@ -217,8 +218,11 @@ export const actions = {
       await locked(stateDir, id, async () => {
         const row = await hc(io, ["get", options.terminal, "--json"]);
         if (row.state !== "live") throw new Error(`Terminal ${row.address} is not live`);
-        const other = (await observe(io, id)).labelled.find(live => live.address !== row.address && holds(live, id));
+        const observed = await observe(io, id);
+        const other = observed.labelled.find(live => live.address !== row.address && holds(live, id));
         if (other) throw new Error(`This session is already open in terminal ${other.address}`);
+        // Terminals an agent of this session died in keep its labels; they are plain shells again.
+        for (const left of observed.labelled) if (left.address !== row.address) await hc(io, ["label", left.address, "--json", ...UNLABEL]);
         await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}`, `projects.control=${descriptor(stateDir)}`]);
         rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,
           space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }));
