@@ -1,16 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { actions, readRecord, wrap } from "../core/control.mjs";
 import { writeRecord } from "../core/store.mjs";
 import { remove } from "../pi/adapter.mjs";
 
-const control = fileURLToPath(new URL("../core/control.mjs", import.meta.url));
 const DEAD = 2 ** 31 - 1; // above any pid_max, so no process has it
 
 function fixture(t) {
@@ -96,12 +93,6 @@ test("messages are wrapped in one form with escaped attributes", () => {
   assert.equal(wrap({ from: "thread", title: `a "b" <c> & d`, id, text: "line <one>\nline two" }),
     `<message from="thread" title="a &quot;b&quot; &lt;c&gt; &amp; d" id="${id}">\nline <one>\nline two\n</message>`);
   assert.equal(wrap({ from: "user", text: "hello" }), `<message from="user">\nhello\n</message>`);
-});
-
-test("a bin link to control.mjs runs the command line", t => {
-  const f = fixture(t), link = join(f.root, "pi-projects");
-  symlinkSync(control, link);
-  assert.deepEqual(JSON.parse(execFileSync(link, ["list", JSON.stringify({ stateDir: f.stateDir })], { encoding: "utf8" })), { sessions: [] });
 });
 
 test("delete removes only the conversations of the deleted sessions", async t => {

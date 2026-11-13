@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 
 // record.adapter: { sessionId, sessionFile, command: Pi argv prefix, env: values of ENV }
-export const ENV = ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_PROJECTS_STATE_DIR", "PI_PROJECTS_PI_COMMAND", "PATH"];
+export const ENV = ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PROJECTS_STATE_DIR", "PI_PROJECTS_PI_COMMAND", "PATH"];
 
 function command(record) {
   const { command } = record.adapter;

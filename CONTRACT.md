@@ -5,7 +5,7 @@ whom, with no agent-specific code. An adapter starts, resumes and deletes one to
 
 ## Records
 
-`stateDir` is `options.stateDir`, else `$PI_PROJECTS_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/pi-projects`.
+`stateDir` is `options.stateDir`, else `$PROJECTS_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/projects`.
 
 ```
 <stateDir>/sessions/<id>.json   one record per session
@@ -57,8 +57,7 @@ message was typed; when the recipient was `idle` or `done` and no turn started, 
 
 ## Actions
 
-`node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control` and the `pi-projects` bin
-link) prints one JSON object; errors print `projects: message` on stderr and exit 1. The same
+`node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control`) prints one JSON object; errors print `projects: message` on stderr and exit 1. The same
 functions are `actions[name](options, io)` in `core/control.mjs`, next to `stateDirectory()`,
 `readRecord(stateDir, id)` and `findRecord(stateDir, predicate)`. `by` is `"user"` or `"agent"`.
 

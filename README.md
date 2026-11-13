@@ -36,7 +36,7 @@ The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `threa
 - A report to a closed project waits until you resume it.
 - Write in a resolved thread to reopen it.
 - Only you can delete.
-- State lives in `~/.local/state/pi-projects`. Nothing is written into your repo.
+- State lives in `~/.local/state/projects`. Nothing is written into your repo.
 
 ## Update, remove
 

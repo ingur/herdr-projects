@@ -394,7 +394,7 @@ export async function main(argv = process.argv.slice(2)) {
   return result;
 }
 
-// Real paths, so the installed `pi-projects` bin link runs main too.
+// Real paths, so a symlinked checkout still runs main.
 function invoked() {
   try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
   catch { return false; }

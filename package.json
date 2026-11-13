@@ -6,7 +6,6 @@
   "license": "MIT",
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./pi/projects.ts"] },
-  "bin": { "pi-projects": "./core/control.mjs" },
   "files": ["core", "pi", "CONTRACT.md"],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

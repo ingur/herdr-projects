@@ -10,7 +10,7 @@ fi
 unset HC_TERMINAL_ID HC_TERMINAL_SOCKET
 export HC_SESSION=pp-smoke PI_CODING_AGENT_DIR="$repo/.state/pi"
 work=$(cd "$(mktemp -d)" && pwd -P)
-export PI_PROJECTS_STATE_DIR="$work/state"
+export PROJECTS_STATE_DIR="$work/state"
 transcripts="$PI_CODING_AGENT_DIR/sessions/--$(printf %s "${work#/}" | tr / -)--"
 trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$work" "$transcripts"' EXIT
 

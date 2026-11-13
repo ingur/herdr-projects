@@ -35,7 +35,7 @@ function adapter(ctx: ExtensionContext, stateDir: string) {
   for (const name of ENV) {
     if (process.env[name] !== undefined) env[name] = process.env[name];
   }
-  env.PI_PROJECTS_STATE_DIR = stateDir;
+  env.PROJECTS_STATE_DIR = stateDir;
   return { sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(), command: piCommand(), env };
 }
 
