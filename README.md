@@ -17,7 +17,7 @@ Needs `hc` (herdr-core). Linux and macOS.
 Start `pi` in a herdr terminal, then:
 
 ```text
-/projects init My project
+/projects new My project
 ```
 
 Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://github.com/ingur/herdr-project-spaces)).
@@ -25,17 +25,16 @@ Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://
 | Command | |
 | --- | --- |
 | `/projects` | status |
-| `/projects init [name]` | turn this session into a project |
-| `/projects open [name]` | open a stopped project in this terminal |
-| `/projects resume` | let waiting messages in again after you pressed Esc |
-| `/projects retry ID` | deliver one uncertain message again |
+| `/projects new [name]` | turn this session into a project |
+| `/projects resume [name]` | open a stopped project in this terminal |
 
 The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`, `thread_reopen`.
 
 ## Good to know
 
 - Your typing always comes first. Messages from other sessions wait.
-- Closing a project does not stop its threads.
+- Closing a project closes its threads. Resuming it brings back the ones that were open.
+- A report to a closed project waits until you resume it.
 - Write in a resolved thread to reopen it.
 - Only you can delete.
 - State lives in `~/.local/state/pi-projects`. Nothing is written into your repo.

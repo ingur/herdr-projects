@@ -1,6 +1,6 @@
 const roles = {
   coordinator: "You coordinate persistent project threads.",
-  thread: "You are an independent persistent project thread; send relevant changes, questions, and results to your coordinator.",
+  thread: "You are an independent persistent project thread; send relevant changes, questions, and results to your coordinator. Reports to a stopped project wait in its inbox until the human resumes it.",
 };
 
 const sharedInstructions = [
@@ -23,7 +23,7 @@ export function roleInstructions(role, titleSource) {
 export const toolDescriptions = {
   start: "Create an independent persistent Pi thread under your coordinator. A title is unique within that coordinator's group. Reusing it ensures the existing session without sending this instruction again; use thread_send for further instructions. Optional cwd accepts an absolute path or a path relative to the project root, including outside the project (default: the coordinator's directory).",
   list: "Discover this project's coordinators and threads, identities, resolved status and availability. Set detail: true to include mailbox/delivery states and current-session entry IDs needed for exact forwarding. Execution completion remains unknown.",
-  send: "Send to an exact project session UUID, a name in your coordinator group, or coordinator. Supply text OR forward (a user/custom entry ID from thread_list with detail: true in THIS session); original author/text are preserved and note is separately yours. Resolved threads refuse agent sends; call thread_reopen first. Persists first, then ensures the recipient is available without overriding human pause. Do not retry a persisted message merely because recovery is pending.",
+  send: "Send to an exact project session UUID, a name in your coordinator group, or coordinator. Supply text OR forward (a user/custom entry ID from thread_list with detail: true in THIS session); original author/text are preserved and note is separately yours. Resolved threads refuse agent sends; call thread_reopen first. Persists first; stopped threads are launched, but messages to a stopped coordinator wait until the human resumes the project. Human pause is never overridden. Do not resend a persisted message merely because delivery is waiting.",
   rename: "Set a short, specific title for self (default), an exact project session UUID, a name in your coordinator group, or coordinator. Coordinators may name their project. Human-chosen titles are protected; a thread's coordinator receives an informational rename notice.",
   resolve: "Archive a completed thread by UUID/name or self. Changes only resolved status: no terminal closure, cancellation, inbox deletion or pause changes. Existing work may finish.",
   reopen: "Clear a thread's resolved status and ensure the same conversation is available, retaining its UUID, transcript, coordinator and title. Does not steal focus, clear human pause or replay an interrupted model turn.",
@@ -33,8 +33,10 @@ export function wakeInstruction(messageId) {
   return `Handle the requested work or questions in project-thread message ${messageId} above. Human instructions take precedence. Avoid unsolicited acknowledgment-only messages between sessions, not explicitly requested answers.`;
 }
 
-export function formatEnvelope(message) {
+export function formatEnvelope(message, redelivered = false) {
   const provenance = JSON.stringify({ id: message.id, sender: message.sender, originalAuthor: message.author, source: message.source, via: message.via });
-  return `Project-thread message (not a direct user turn)\nProvenance: ${provenance}\n\n--- original text ---\n${message.text}\n--- end original text ---` +
+  return `Project-thread message (not a direct user turn)\nProvenance: ${provenance}` +
+    (redelivered ? "\nDelivery note: This may repeat a message delivered before an interruption." : "") +
+    `\n\n--- original text ---\n${message.text}\n--- end original text ---` +
     (message.note === undefined ? "" : `\n\nSeparate note by ${JSON.stringify(message.sender)}:\n${message.note}`);
 }

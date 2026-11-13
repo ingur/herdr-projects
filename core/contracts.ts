@@ -42,7 +42,7 @@ export const recordSchema = Type.Object({
   sessionFile: Type.Optional(Type.String()), sessionDir: Type.Optional(Type.String()),
   registration: Type.String(), owner: Type.Optional(ownerSchema), initial: Type.Optional(messageSchema),
   launchState: Type.Optional(Type.String()), launchError: Type.Optional(Type.String()), created: Type.Optional(Type.String()),
-  resolved: Type.Optional(Type.Boolean()), rank: Type.Optional(Type.Number()),
+  resolved: Type.Optional(Type.Boolean()), reopenWithProject: Type.Optional(Type.Boolean()), rank: Type.Optional(Type.Number()),
   resolvedBy: Type.Optional(Type.Object({ kind: Type.Union([Type.Literal("human"), Type.Literal("agent")]), session: Type.Optional(Type.String()) })),
   transcriptState: Type.Optional(Type.Union([Type.Literal("expected"), Type.Literal("unwritten")])),
 });
@@ -58,7 +58,7 @@ export type Terminal = Static<typeof terminalSchema>;
 export type Owner = Static<typeof ownerSchema>;
 export interface DeliveryView {
   message: Message;
-  delivery: { state: string; execution: string; entry?: string; attempted?: string };
+  delivery: { state: string; execution: string; entry?: string; attempted?: string; redelivered?: boolean };
 }
 
 export function parse<T extends TSchema>(schema: T, value: unknown, label: string): Static<T> {

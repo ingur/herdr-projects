@@ -9,8 +9,9 @@ import { Store } from "../core/store.mjs";
 import { acquireLock, atomicJSON } from "../core/lib/state.mjs";
 import { mayDeliver } from "../core/lib/delivery.mjs";
 import { ownerState, processIdentity } from "../core/lib/process.mjs";
-import { MESSAGE_TYPE, deliveryState } from "../core/messages.mjs";
+import { MESSAGE_TYPE, deliveryAttempt, deliveryState, waitingDelivery } from "../core/messages.mjs";
 import { forwardEntry, receiptEntries } from "../pi/messages.mjs";
+import { formatEnvelope } from "../pi/prompts.mjs";
 
 function fixture(t) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "projects-")));
@@ -74,16 +75,28 @@ test("wrong mailbox identity is rejected rather than delivered to the current wr
   assert.throws(() => store.record(id), /identity/);
 });
 
-test("uncertain attempts never auto-replay and explicit retry remains pending until attempted", () => {
-  assert.equal(deliveryState(undefined).state, "pending");
-  assert.equal(deliveryState({ state: "attempting" }).state, "uncertain");
-  assert.equal(deliveryState({ state: "recorded", entry: "lost-on-disk" }).state, "uncertain");
-  const allowed = deliveryState({ state: "retry-authorized" });
-  assert.equal(allowed.state, "pending");
-  assert.equal(allowed.execution, "unknown");
-  assert.equal(deliveryState(allowed).state, "pending");
-  assert.equal(deliveryState({ state: "retry-authorized" }, "visible").state, "visible-not-durable");
-  assert.equal(deliveryState({ state: "attempting" }, "visible", "disk").state, "recorded");
+test("an interrupted delivery is redelivered once with a visible note, even across restarts", t => {
+  const { root, state, store, id, message } = fixture(t);
+  const attempt = deliveryAttempt(deliveryState(undefined), "unknown");
+  store.mark(id, message.id, attempt);
+  const reopened = new Store(state, root);
+  const uncertain = deliveryState(reopened.delivery(id, message.id));
+  assert.equal(uncertain.state, "uncertain");
+  assert.equal(waitingDelivery(uncertain), true);
+  const redelivery = deliveryAttempt(uncertain, "unknown");
+  reopened.mark(id, message.id, redelivery);
+  assert.equal(redelivery.redelivered, true);
+  const original = formatEnvelope(message), repeated = formatEnvelope(message, redelivery.redelivered);
+  assert.equal(repeated.replace(/\nDelivery note: [^\n]+/, ""), original, "transport note does not change original attribution or text");
+  assert.match(repeated, /may repeat.*before an interruption/);
+  const interruptedAgain = deliveryState(store.delivery(id, message.id));
+  assert.equal(interruptedAgain.state, "uncertain");
+  assert.equal(waitingDelivery(interruptedAgain), false);
+  assert.equal(waitingDelivery(deliveryState(interruptedAgain)), false);
+  const recorded = deliveryState(redelivery, "visible", "disk");
+  assert.equal(recorded.state, "recorded");
+  assert.equal(recorded.redelivered, true);
+  assert.equal(waitingDelivery(deliveryState(recorded)), false, "even a subsequently lost receipt cannot allow another redelivery");
 });
 
 test("visible memory is not durable evidence and receipt identity includes recipient", () => {

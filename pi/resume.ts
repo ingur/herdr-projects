@@ -7,7 +7,7 @@ import { stateDirectory } from "../core/store.mjs";
 import { describeError, type ThreadRecord } from "../core/contracts.ts";
 import { findSessionRecord } from "./registration.mjs";
 import { launchCwd } from "./pi-launch.mjs";
-import { changedWorkingFolder, displayFolder, matchProject, projectCandidates, projectConversation } from "./open.mjs";
+import { changedWorkingFolder, displayFolder, matchProject, projectCandidates, projectConversation } from "./resume.mjs";
 
 type Project = Pick<ThreadRecord, "id" | "title" | "cwd" | "resolved">;
 
@@ -21,10 +21,10 @@ function pickProject(ctx: ExtensionCommandContext, candidates: Project[], query:
     list.setFilter(query);
     list.onSelect = item => done(candidates[items.indexOf(item)]);
     list.onCancel = () => done(undefined);
-    container.addChild(new Text(theme.fg("accent", "Open project — type to filter"), 1, 0));
+    container.addChild(new Text(theme.fg("accent", "Resume project — type to filter"), 1, 0));
     container.addChild(input);
     container.addChild(list);
-    container.addChild(new Text(theme.fg("dim", `${keyHint("tui.select.confirm", "open")} ${keyHint("tui.select.cancel", "cancel")}`), 1, 0));
+    container.addChild(new Text(theme.fg("dim", `${keyHint("tui.select.confirm", "resume")} ${keyHint("tui.select.cancel", "cancel")}`), 1, 0));
     return {
       capturesViewportInput: true,
       get focused() { return input.focused; },
@@ -44,15 +44,15 @@ function pickProject(ctx: ExtensionCommandContext, candidates: Project[], query:
   });
 }
 
-export async function openProject(ctx: ExtensionCommandContext, query: string) {
+export async function resumeProject(ctx: ExtensionCommandContext, query: string) {
   let file: string;
   try {
-    if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("Opening a project requires interactive Pi.");
-    if (!LOCAL_TERMINAL.test(process.env.HC_TERMINAL_ID ?? "")) throw new Error("Open an hc terminal and run /projects open there.");
+    if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("Resuming a project requires interactive Pi.");
+    if (!LOCAL_TERMINAL.test(process.env.HC_TERMINAL_ID ?? "")) throw new Error("Open an hc terminal and run /projects resume there.");
     const stateDir = stateDirectory();
     const catalog = await listSessions({ stateDir });
     const candidates = projectCandidates(catalog.sessions, ctx.sessionManager.getSessionId());
-    if (!candidates.length) { ctx.ui.notify("There are no stopped projects to open.", "info"); return; }
+    if (!candidates.length) { ctx.ui.notify("There are no stopped projects to resume.", "info"); return; }
     const selected = matchProject(candidates, query) ?? await pickProject(ctx, candidates, query);
     if (!selected) return;
     const record = findSessionRecord(stateDir, selected.id);

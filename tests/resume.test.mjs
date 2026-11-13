@@ -4,11 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { changedWorkingFolder, displayFolder, matchProject, projectCandidates, projectConversation } from "../pi/open.mjs";
+import { changedWorkingFolder, displayFolder, matchProject, projectCandidates, projectConversation } from "../pi/resume.mjs";
 
 const project = (id, extra = {}) => ({ id, agent: "pi", role: "coordinator", writer: "dead", title: id, cwd: "/one", ...extra });
 
-test("open candidates span folders, exclude current/live/uncertain writers and threads, and sort recent before resolved", () => {
+test("resume candidates span folders, exclude current/live/uncertain writers and threads, and sort recent before resolved", () => {
   const rows = [project("resolved", { resolved: true, registered: "2026-12-01" }),
     project("older", { registered: "2026-01-01" }), project("recent", { cwd: "/other", registered: "2025-01-01", observed: "2026-02-01" }),
     project("current"), project("live", { writer: "live" }), project("uncertain", { writer: "unknown" }),
@@ -36,8 +36,8 @@ test("folder display shortens only the home boundary and announces a different w
   assert.equal(changedWorkingFolder("/other", "/one"), "/other");
 });
 
-test("opening uses the retained conversation identity and never invents an unwritten or lost transcript", t => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "project-open-")));
+test("resuming uses the retained conversation identity and never invents an unwritten or lost transcript", t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "project-resume-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const cwd = join(root, "other-project"), sessionDir = join(root, "sessions");
   mkdirSync(cwd); mkdirSync(sessionDir);

@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { processIdentity } from "../core/lib/process.mjs";
 import { atomicJSON, lockState } from "../core/lib/state.mjs";
-import { acquireSessionLocks, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, releaseSessionRegistration, unregisterCurrentSession } from "../pi/registration.mjs";
+import { acquireSessionLocks, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, releaseSessionRegistration, shutdownProjectThreads, unregisterCurrentSession } from "../pi/registration.mjs";
 import { checkedSessionFile, piLaunchCommand } from "../pi/pi-launch.mjs";
 import { Store, stateDirectory } from "../core/store.mjs";
 import { listSessions } from "../core/control.mjs";
@@ -51,9 +51,10 @@ test("promotion and lookup by session UUID retain conversation, root, role and o
   const id = randomUUID(), file = join(f.binding.sessionDir, "thread.jsonl");
   writeFileSync(file, JSON.stringify({ type: "session", id, cwd: f.projectRoot }) + "\n");
   f.store.save({ id, agent: "pi", projectRoot: f.projectRoot, cwd: f.projectRoot, role: "thread", coordinator: promoted.id,
-    title: "Retained thread", titleSource: "agent", resolved: true, registration: "awaiting-extension" });
+    title: "Retained thread", titleSource: "agent", resolved: true, registration: "awaiting-extension", reopenWithProject: true });
   const thread = registerCurrentSession(f.store, { ...f.binding, id, sessionFile: file });
   assert.equal(thread.role, "thread"); assert.equal(thread.coordinator, promoted.id); assert.equal(thread.resolved, true);
+  assert.equal(thread.reopenWithProject, undefined, "individual registration consumes its project-reopen mark");
   assert.throws(() => registerCurrentSession(f.store, { ...f.binding, id, promote: true }), /already registered as a thread/);
   assert.deepEqual(piLaunchCommand(promoted, f.stateDir), [join(f.stateDir, "bin", "pi"), "--session", f.binding.sessionFile]);
   assert.equal(readFileSync(f.binding.sessionFile, "utf8"), f.transcript);
@@ -156,4 +157,47 @@ test("failed label cleanup still saves an offline record and releases both write
   assert.equal(f.store.record(f.binding.id).owner, undefined);
   const next = acquireSessionLocks(f.stateDir, f.store, f.binding.id);
   for (const lock of next.reverse()) lock.release();
+});
+
+test("clean shutdown starts the stable control shim detached so it finishes after Pi's process exits", async t => {
+  const f = fixture(t), output = join(f.root, "closed.json"), parentFile = join(f.root, "parent");
+  const bin = join(f.stateDir, "bin"); mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "control"), `#!${process.execPath}
+const fs = require("node:fs");
+const parent = Number(fs.readFileSync(${JSON.stringify(parentFile)}, "utf8"));
+const timer = setInterval(() => {
+  try { process.kill(parent, 0); }
+  catch (error) {
+    if (error.code !== "ESRCH") throw error;
+    clearInterval(timer);
+    fs.writeFileSync(${JSON.stringify(output + ".tmp")}, JSON.stringify(process.argv.slice(2)));
+    fs.renameSync(${JSON.stringify(output + ".tmp")}, ${JSON.stringify(output)});
+  }
+}, 10);
+setTimeout(() => process.exit(1), 5000).unref();
+`, { mode: 0o700 });
+  let watcher;
+  const written = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Detached control did not finish")), 7000);
+    watcher = watch(f.root, () => {
+      if (!existsSync(output)) return;
+      clearTimeout(timer); watcher.close(); resolve();
+    });
+    t.after(() => { clearTimeout(timer); watcher.close(); });
+  });
+  const binding = { role: "coordinator", stateDir: f.stateDir, projectRoot: f.projectRoot, id: f.binding.id };
+  const launcher = spawn(process.execPath, ["--input-type=module", "-e", `
+import { writeFileSync } from "node:fs";
+import { shutdownProjectThreads } from ${JSON.stringify(new URL("../pi/registration.mjs", import.meta.url).href)};
+writeFileSync(${JSON.stringify(parentFile)}, String(process.pid));
+shutdownProjectThreads(${JSON.stringify(binding)}, "quit");
+process.exit(0);
+`], { stdio: "ignore" });
+  await new Promise((resolve, reject) => { launcher.once("error", reject); launcher.once("exit", code => code === 0 ? resolve() : reject(new Error(String(code)))); });
+  await written;
+  const [action, options] = JSON.parse(readFileSync(output, "utf8"));
+  assert.equal(action, "close-threads");
+  assert.deepEqual(JSON.parse(options), { stateDir: f.stateDir, projectRoot: f.projectRoot, id: f.binding.id });
+  await shutdownProjectThreads({ role: "thread" }, "quit");
+  await shutdownProjectThreads({ role: "coordinator" }, "reload");
 });

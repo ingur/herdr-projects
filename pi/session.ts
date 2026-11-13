@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync } from "node:fs";
 import { describeError, getRecord, messages, parse, recordSchema, terminalSchema, type DeliveryView } from "../core/contracts.ts";
 import type { Runtime } from "./types.ts";
-import { MESSAGE_TYPE, deliveryState, shouldReopen } from "../core/messages.mjs";
+import { MESSAGE_TYPE, deliveryAttempt, deliveryState, shouldReopen, waitingDelivery } from "../core/messages.mjs";
 import { receiptEntries } from "./messages.mjs";
 import { mayDeliver } from "../core/lib/delivery.mjs";
 import { formatEnvelope, roleInstructions, wakeInstruction } from "./prompts.mjs";
@@ -10,9 +10,9 @@ import { Store, stateDirectory } from "../core/store.mjs";
 import { canonicalPath, sessionId } from "../core/lib/state.mjs";
 import { LOCAL_TERMINAL, terminalPlacement } from "../core/hc.mjs";
 import { command } from "./threads.ts";
-import { publishControlDescriptor, renameSession, reopenSession } from "../core/control.mjs";
+import { publishControlDescriptor, renameSession, reopenProjectThreads, reopenSession } from "../core/control.mjs";
 import { observeEditor } from "./interaction.ts";
-import { PROJECT_TOOLS, acquireSessionLocks, dormantHint, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, releaseSessionRegistration } from "./registration.mjs";
+import { PROJECT_TOOLS, acquireSessionLocks, dormantHint, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, releaseSessionRegistration, shutdownProjectThreads } from "./registration.mjs";
 import { writeLaunchShims } from "./pi-launch.mjs";
 
 export function createSessionRuntime(pi: ExtensionAPI) {
@@ -89,10 +89,11 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     if (!mayDeliver({ modelSelected: true, idle: r.ctx.isIdle(), focused: r.editor?.focused === true,
       pending: r.ctx.hasPendingMessages(), draft: r.ctx.ui.getEditorText(), lastInteraction: r.lastInteraction,
       paused: r.paused, promptOpen: r.promptOpen, inFlight: r.inFlight })) return false;
-    const message = pending.find(item => !messageNeedsTurn(item.message))?.message;
-    if (!message) return false;
-    r.store.mark(r.id, message.id, { state: "attempting", attempted: new Date().toISOString(), execution: "not-requested" });
-    pi.sendMessage({ customType: MESSAGE_TYPE, content: formatEnvelope(message), display: true, details: { envelope: message } }, { triggerTurn: false });
+    const item = pending.find(item => !messageNeedsTurn(item.message));
+    if (!item) return false;
+    const attempt = deliveryAttempt(item.delivery, "not-requested");
+    r.store.mark(r.id, item.message.id, attempt);
+    pi.sendMessage({ customType: MESSAGE_TYPE, content: formatEnvelope(item.message, attempt.redelivered), display: true, details: { envelope: item.message } }, { triggerTurn: false });
     return true;
   }
 
@@ -107,32 +108,30 @@ export function createSessionRuntime(pi: ExtensionAPI) {
         setSessionName(r, title);
       }
       const states = reconcileDelivery(r);
-      const uncertain = states.filter(item => item.delivery.state === "uncertain").length;
-      const pending = states.filter(item => item.delivery.state === "pending");
+      const uncertain = states.filter(item => item.delivery.state === "uncertain" && item.delivery.redelivered).length;
+      const pending = states.filter(item => waitingDelivery(item.delivery));
       if (r.inFlight && r.ctx.isIdle() && Date.now() - r.wakeAt > 3000) {
         // sendMessage has no promise/error return; a failed preflight may emit no settled event.
         r.inFlight = false;
-        pause(r, true, "Wake ended without an observed settlement; inspect Pi error, then /projects resume");
+        pause(r, true, "Wake ended without an observed settlement; inspect Pi error, then submit a prompt");
       }
       const model = r.ctx.model;
       const modelSelected = !!model && r.ctx.modelRegistry.find(model.provider, model.id) !== undefined;
-      updateStatus(r, `${r.paused ? "paused; " : ""}${pending.length} pending${uncertain ? `; ${uncertain} uncertain (thread_list detail)` : ""}${!modelSelected && pending.length ? "; waiting for model (/login, then /model)" : ""}${r.editor?.focusUnavailable ? "; editor focus unavailable" : ""}`);
+      updateStatus(r, `${r.paused ? "paused; " : ""}${pending.length} waiting${uncertain ? `; ${uncertain} possibly undelivered` : ""}${!modelSelected && pending.length ? "; waiting for model (/login, then /model)" : ""}${r.editor?.focusUnavailable ? "; editor focus unavailable" : ""}`);
       if (deliverInformational(r, pending)) return;
       if (!pending.length || !mayDeliver({ modelSelected, idle: r.ctx.isIdle(), pending: r.ctx.hasPendingMessages(), draft: r.ctx.ui.getEditorText(),
         focused: r.editor?.focused === true, lastInteraction: r.lastInteraction, paused: r.paused, promptOpen: r.promptOpen, inFlight: r.inFlight })) return;
-      const message = pending.find(item => messageNeedsTurn(item.message))?.message;
-      if (!message) return;
-      r.store.mark(r.id, message.id, { state: "attempting", attempted: new Date().toISOString(), execution: "unknown" });
+      const item = pending.find(item => messageNeedsTurn(item.message));
+      if (!item) return;
+      const { message } = item;
+      const attempt = deliveryAttempt(item.delivery, "unknown");
+      r.store.mark(r.id, message.id, attempt);
+      // First make the attributed notice visible even if provider authentication prevents a turn.
+      pi.sendMessage({ customType: MESSAGE_TYPE, content: formatEnvelope(message, attempt.redelivered), display: true, details: { envelope: message } }, { triggerTurn: false });
+      const receipt = receipts(r).visible.get(message.id);
+      if (!receipt) return;
       r.inFlight = true;
       r.wakeAt = Date.now();
-      // First make the attributed notice visible even if provider authentication prevents a turn.
-      pi.sendMessage({ customType: MESSAGE_TYPE, content: formatEnvelope(message), display: true, details: { envelope: message } }, { triggerTurn: false });
-      const receipt = receipts(r).visible.get(message.id);
-      if (!receipt) {
-        pause(r, true, "Injection uncertain; inspect thread_list with detail");
-        r.inFlight = false;
-        return;
-      }
       pi.sendMessage({ customType: "projects.wake", content: wakeInstruction(message.id), display: false,
         details: { message: message.id } }, { triggerTurn: true });
     } catch (error) {
@@ -158,7 +157,7 @@ export function createSessionRuntime(pi: ExtensionAPI) {
       if (!previous && !promote) { failure = dormantHint; return; }
       if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("Projects requires interactive Pi, not print/RPC mode");
       const terminalId = process.env.HC_TERMINAL_ID;
-      if (!terminalId || !LOCAL_TERMINAL.test(terminalId)) throw new Error("Projects needs an hc terminal. Open one with hc, run pi there, then use /projects init.");
+      if (!terminalId || !LOCAL_TERMINAL.test(terminalId)) throw new Error("Projects needs an hc terminal. Open one with hc, run pi there, then use /projects new.");
       const sessionFile = ctx.sessionManager.getSessionFile();
       const sessionDir = ctx.sessionManager.getSessionDir();
       if (!sessionFile) throw new Error("Projects needs a persistent Pi session; do not use --no-session.");
@@ -199,6 +198,12 @@ export function createSessionRuntime(pi: ExtensionAPI) {
       poll.unref();
       updateStatus(r, `registered ${role} ${id.slice(0, 8)}${r.paused ? "; paused" : ""}`);
       ctx.ui.notify(`Projects registered as ${title} (${id}). /projects for commands.`, "info");
+      if (role === "coordinator") {
+        try {
+          const { errors } = await reopenProjectThreads({ stateDir, projectRoot, id });
+          for (const error of errors) ctx.ui.notify(`Could not reopen thread ${error.title}: ${error.error}`, "error");
+        } catch (error) { ctx.ui.notify(`Could not reopen project threads: ${describeError(error)}`, "error"); }
+      }
       tick(r);
       return r;
     } catch (error) {
@@ -233,7 +238,14 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => { await cleanup(ctx); });
+  pi.on("session_shutdown", async (event, ctx) => {
+    const results = await Promise.allSettled([
+      runtime ? shutdownProjectThreads(runtime, event.reason) : Promise.resolve(),
+      cleanup(ctx),
+    ]);
+    const failed = results.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
+  });
 
   // Only a turn that began with an open thread may undo a different session's agent resolution.
   const reopenForHuman = async (r: Runtime, settled = false) => {
@@ -272,7 +284,7 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     runtime.inFlight = false;
     if (!runtime.transcriptObserved) runtime.transcriptObserved = observeTranscript(runtime.store, runtime);
     runtime.lastInteraction = Date.now();
-    if (event.aborted) pause(runtime, true, "Agent run aborted; submit a prompt or /projects resume");
+    if (event.aborted) pause(runtime, true, "Agent run aborted; submit a prompt to allow waiting messages");
     if (humanTurn) {
       humanTurn = false;
       await reopenForHuman(runtime, true);
@@ -284,7 +296,7 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     event.systemPromptOptions.sections.projects = roleInstructions(runtime.role, getRecord(runtime.store, runtime.id)?.titleSource);
   });
 
-  return { bound, independent: () => !runtime, reconcileDelivery, pause, init: async (ctx: ExtensionContext, title?: string) => {
+  return { bound, independent: () => !runtime, reconcileDelivery, promote: async (ctx: ExtensionContext, title?: string) => {
     return register(ctx, true, title);
   } };
 }

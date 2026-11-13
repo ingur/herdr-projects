@@ -29,6 +29,7 @@ function validateRecord(record) {
   if (!isAbsolute(record.projectRoot || "") || !isAbsolute(record.cwd || "") || typeof record.registration !== "string") throw new Error("Invalid session project/cwd/registration");
   if (record.terminal !== undefined && !LOCAL_TERMINAL.test(record.terminal)) throw new Error("Invalid local terminal identity");
   if (record.resolved !== undefined && typeof record.resolved !== "boolean") throw new Error("Invalid resolved state");
+  if (record.reopenWithProject !== undefined && typeof record.reopenWithProject !== "boolean") throw new Error("Invalid reopen-with-project state");
   if (record.rank !== undefined && !Number.isFinite(record.rank)) throw new Error("Invalid session rank");
   if (record.transcriptState !== undefined && !["expected", "unwritten"].includes(record.transcriptState)) throw new Error("Invalid transcript state");
   if (record.resolvedBy !== undefined) {
@@ -273,6 +274,7 @@ export async function ensureSession(options, io = {}) {
   const result = (extra = {}) => ({ ...view(stateDir, store.directory, store.record(options.id), rows), ...extra });
   try {
     const before = store.record(options.id);
+    if (before.role === "thread" && before.reopenWithProject) store.patch(before.id, { reopenWithProject: undefined });
     const coordinator = before.role === "thread" && space === undefined ? store.record(before.coordinator) : undefined;
     const discover = discoverLaunch(before);
     try {
@@ -352,11 +354,12 @@ export async function showSession(options, io = {}) {
   throw new Error(`Session terminal ownership is not confirmed; no focus performed${ensured.error ? `: ${ensured.error}` : " (launch may still be pending)"}`);
 }
 
-async function closeOwnedSession(stateDir, store, id, io, deleting = false) {
+async function closeOwnedSession(stateDir, store, id, io, { deleting = false, withProject = false } = {}) {
   const record = validateRecord(store.record(id));
   const discover = discoverLaunch(record);
   const rows = await terminals(io, discover ? undefined : new Set([record.terminal]), false, discover ? record.id : undefined);
   const row = rows.find(row => row.address === record.terminal);
+  if (withProject && (!row || !ownership(stateDir, store.directory, record, row))) return { closed: false };
   if (!row || row.state === "finished" || deleting && !ownership(stateDir, store.directory, record, row)) {
     if (writerState(stateDir, store.directory, record) !== "dead" || discover && launchPending(record, rows)) throw new Error("Session terminal ownership is uncertain; no terminal killed");
     return { ...view(stateDir, store.directory, record, rows), closed: true };
@@ -364,7 +367,7 @@ async function closeOwnedSession(stateDir, store, id, io, deleting = false) {
   const observed = terminal(await (io.command ?? command)("hc", ["get", row.address, "--json"]));
   const current = validateRecord(store.record(id));
   if (!ownership(stateDir, store.directory, current, observed)) throw new Error("Session terminal ownership is not confirmed; no terminal killed");
-  store.patch(current.id, terminalPlacement(observed));
+  store.patch(current.id, { ...terminalPlacement(observed), ...(withProject ? { reopenWithProject: true } : {}) });
   // hc has no conditional kill: revalidate immediately before its address-only operation.
   let killed = terminal(await (io.command ?? command)("hc", ["kill", observed.address, "--json"], 15000));
   for (let attempt = 0; killed.address === observed.address && killed.state === "live" && attempt < 30; attempt++) {
@@ -372,15 +375,68 @@ async function closeOwnedSession(stateDir, store, id, io, deleting = false) {
     killed = terminal(await (io.command ?? command)("hc", ["get", observed.address, "--json"]));
   }
   if (killed.address !== observed.address || killed.state !== "finished") throw new Error("hc did not confirm that the owned terminal closed");
-  if (!deleting) notice(store, current, "closed");
+  if (!deleting && !withProject) notice(store, current, "closed");
   return { ...view(stateDir, store.directory, store.record(id), [killed]), closed: true };
 }
 
+async function controlLock(stateDir, id, io) {
+  for (;;) {
+    try { return acquireLock(join(stateDir, "control-locks", id)); }
+    catch (error) {
+      if (error.code !== "ELOCKED") throw error;
+      await (io.delay ?? delay)(100);
+    }
+  }
+}
+
+export async function closeThreads(options, io = {}) {
+  const { stateDir, store, record } = open(options);
+  if (record.role !== "coordinator") throw new Error("close-threads id must identify a coordinator");
+  const guard = await controlLock(stateDir, `threads-${record.id}`, io);
+  const closed = [], errors = [];
+  try {
+    for (const thread of store.records().filter(child => child.role === "thread" && child.coordinator === record.id).sort((a, b) => a.id.localeCompare(b.id))) {
+      let childGuard;
+      try {
+        childGuard = await controlLock(stateDir, thread.id, io);
+        if ((await closeOwnedSession(stateDir, store, thread.id, io, { withProject: true })).closed) closed.push(thread.id);
+      } catch (error) { errors.push(`${thread.title} (${thread.id}): ${errorText(error)}`); }
+      finally { childGuard?.release(); }
+    }
+  } finally { guard.release(); }
+  if (errors.length) throw new Error(`Could not close project threads: ${errors.join("; ")}`);
+  return { closed };
+}
+
+export async function reopenProjectThreads(options, io = {}) {
+  const { stateDir, store, record } = open(options);
+  if (record.role !== "coordinator") throw new Error("Reopening project threads requires a coordinator");
+  const guard = await controlLock(stateDir, `threads-${record.id}`, io);
+  const errors = [];
+  try {
+    const threads = store.records().filter(child => child.role === "thread" && child.coordinator === record.id && child.reopenWithProject);
+    for (const candidate of threads) {
+      const thread = store.transaction(() => {
+        const current = store.record(candidate.id);
+        return current?.reopenWithProject ? store.patch(current.id, { reopenWithProject: undefined }) : undefined;
+      });
+      if (!thread || thread.resolved) continue;
+      try {
+        const result = await ensureSession({ stateDir, projectRoot: record.projectRoot, id: thread.id }, io);
+        if (result.error) errors.push({ id: thread.id, title: thread.title, error: result.error });
+      } catch (error) { errors.push({ id: thread.id, title: thread.title, error: errorText(error) }); }
+    }
+  } finally { guard.release(); }
+  return { errors };
+}
+
 export async function closeSession(options, io = {}) {
-  const { stateDir, store } = open(options);
+  const { stateDir, store, record } = open(options);
   const guard = acquireLock(join(stateDir, "control-locks", options.id));
-  try { return await closeOwnedSession(stateDir, store, options.id, io); }
-  finally { guard.release(); }
+  try {
+    if (record.role === "coordinator") await closeThreads(options, io);
+    return await closeOwnedSession(stateDir, store, options.id, io);
+  } finally { guard.release(); }
 }
 
 export async function deleteSession(options, io = {}) {
@@ -407,7 +463,7 @@ export async function deleteSession(options, io = {}) {
       const writer = checkedStatePath(stateDir, join(stateDir, "writer-locks", id));
       const extension = checkedStatePath(stateDir, join(store.directory, "locks", `extension-${id}`));
       const removeConversation = await conversationRemover(target.agent);
-      await closeOwnedSession(stateDir, store, id, io, true);
+      await closeOwnedSession(stateDir, store, id, io, { deleting: true });
       for (let attempt = 0; writerState(stateDir, store.directory, validateRecord(store.record(id))) !== "dead"; attempt++) {
         if (attempt === 30) throw new Error(`Session ${id} still has a live or uncertain writer; no conversation deleted`);
         await (io.delay ?? delay)(100);
@@ -439,12 +495,12 @@ export async function resolveSession(options) {
   if (!["agent", "human"].includes(by)) throw new Error("Resolve by must be agent or human");
   if (record.role === "coordinator" && by === "agent") throw new Error("Only humans can resolve projects");
   const resolvedBy = { kind: by, ...(by === "agent" && options.session !== undefined ? { session: sessionId(options.session) } : {}) };
-  const resolved = store.patch(record.id, { resolved: true, resolvedBy });
+  const resolved = store.patch(record.id, { resolved: true, resolvedBy, reopenWithProject: undefined });
   if (!record.resolved) notice(store, resolved, "resolved");
   return view(stateDir, store.directory, resolved);
 }
 function reopenRecord(store, record) {
-  const reopened = store.patch(record.id, { resolved: false, resolvedBy: undefined });
+  const reopened = store.patch(record.id, { resolved: false, resolvedBy: undefined, reopenWithProject: undefined });
   if (record.resolved) notice(store, reopened, "reopened");
 }
 export async function reopenSession(options, io = {}) {
@@ -490,10 +546,17 @@ export async function publishMessage(options, envelope, io = {}) {
   }
   store.publish(message);
   let availability;
-  try { availability = await ensureSession({ stateDir, projectRoot: record.projectRoot, id: record.id }, io); }
-  catch (error) { availability = { error: errorText(error) }; }
+  if (record.role === "coordinator") {
+    const current = store.record(record.id);
+    availability = { ...view(stateDir, store.directory, current), waiting: writerState(stateDir, store.directory, current) !== "live" };
+  } else {
+    try { availability = await ensureSession({ stateDir, projectRoot: record.projectRoot, id: record.id }, io); }
+    catch (error) { availability = { error: errorText(error) }; }
+  }
   return { message: message.id, recipient: record.id, state: "pending", execution: "not-requested", availability,
-    note: "Persisted in recipient inbox. Availability recovery never overrides human pause; delivery is not task completion." };
+    note: availability.waiting
+      ? "Accepted and waiting in the project inbox until the human resumes the project."
+      : "Persisted in recipient inbox. Availability recovery never overrides human pause; delivery is not task completion." };
 }
 
 export async function sendMessage(options, io = {}) {
@@ -507,8 +570,8 @@ export async function sendMessage(options, io = {}) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const actions = { list: listSessions, create: createCoordinator, "create-thread": createThread, ensure: ensureSession, show: showSession, place: placeSession, rename: renameSession, order: orderSession, send: sendMessage, close: closeSession, delete: deleteSession, resolve: resolveSession, reopen: reopenSession };
-  if (argv.length !== 2 || !Object.hasOwn(actions, argv[0])) throw new Error("Usage: node control.mjs <list|create|create-thread|ensure|show|place|rename|order|send|close|delete|resolve|reopen> '<JSON options>'");
+  const actions = { list: listSessions, create: createCoordinator, "create-thread": createThread, ensure: ensureSession, show: showSession, place: placeSession, rename: renameSession, order: orderSession, send: sendMessage, close: closeSession, "close-threads": closeThreads, delete: deleteSession, resolve: resolveSession, reopen: reopenSession };
+  if (argv.length !== 2 || !Object.hasOwn(actions, argv[0])) throw new Error("Usage: node control.mjs <list|create|create-thread|ensure|show|place|rename|order|send|close|close-threads|delete|resolve|reopen> '<JSON options>'");
   const options = JSON.parse(argv[1]);
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("Options must be a JSON object");
   const result = await actions[argv[0]](options);

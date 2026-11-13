@@ -7,7 +7,7 @@ import test from "node:test";
 import { bootIdentity, processIdentity } from "../core/lib/process.mjs";
 import { Store } from "../core/store.mjs";
 import { acquireLock, atomicJSON } from "../core/lib/state.mjs";
-import { closeSession, createThread, deleteSession, ensureSession, listSessions, orderSession, placeSession, publishControlDescriptor, publishMessage, renameSession, reopenSession, resolveSession, sendMessage, showSession } from "../core/control.mjs";
+import { closeSession, closeThreads, createThread, deleteSession, ensureSession, listSessions, orderSession, placeSession, publishControlDescriptor, publishMessage, renameSession, reopenProjectThreads, reopenSession, resolveSession, sendMessage, showSession } from "../core/control.mjs";
 import { shouldReopen } from "../core/messages.mjs";
 import { registerCurrentSession, unregisterCurrentSession } from "../pi/registration.mjs";
 
@@ -353,24 +353,87 @@ test("stopped threads follow their project's newly registered placement, includi
   }
 });
 
-test("close kills only the owned coordinator terminal, leaving threads and transcript intact", async t => {
+test("clean project close closes and marks only live owned threads, retaining conversations without closed notices", async t => {
   const f = fixture(t), io = transport(f), parent = coordinator(f);
   const sessionFile = retained(f), before = readFileSync(sessionFile, "utf8");
-  const child = f.store.record(f.record.id);
-  const row = { address: "t1", state: "live", pid: process.pid, labels: {
-    "projects.session": parent.id, "projects.project": f.store.directory.split("/").pop(),
-    "herdr.space": "current-space", "herdr.tab": "project-tab" } };
-  io.rows.push(row, { address: "t2", state: "live", parent: "t1", pid: process.pid, labels: {} });
-  f.store.patch(parent.id, { terminal: row.address, registration: "registered", owner: processIdentity() });
+  const stopped = f.store.record(f.record.id);
+  const live = f.store.save({ ...stopped, id: randomUUID(), title: "Live", terminal: "t2", resolved: false,
+    registration: "registered", owner: processIdentity() });
+  const resolved = f.store.save({ ...live, id: randomUUID(), title: "Resolved but running", terminal: "t3", resolved: true });
+  const unrelated = f.store.save({ ...live, id: randomUUID(), coordinator: randomUUID(), terminal: "t4" });
+  const unowned = f.store.save({ ...live, id: randomUUID(), terminal: "t5" });
+  io.rows.push({ address: "t1", state: "live", pid: process.pid, labels: {
+    "projects.session": parent.id, "herdr.space": "current-space", "herdr.tab": "project-tab" } },
+    ...[live, resolved, unrelated, unowned].map(thread => ({ address: thread.terminal, state: "live", pid: process.pid,
+      labels: { "projects.session": thread === unowned ? randomUUID() : thread.id } })));
+  f.store.patch(parent.id, { terminal: "t1", registration: "registered", owner: processIdentity() });
   const closed = await closeSession(parent, io);
   assert.equal(closed.closed, true);
   assert.equal(closed.space, "current-space");
-  assert.equal(f.store.record(parent.id).space, "current-space");
-  assert.deepEqual(io.calls.filter(call => call.args[0] === "kill").map(call => call.args), [["kill", "t1", "--json"]]);
-  assert.equal(io.rows[1].state, "live");
-  assert.deepEqual(f.store.record(child.id), child);
+  const kills = io.calls.filter(call => call.args[0] === "kill").map(call => call.args[1]);
+  assert.deepEqual(kills.slice(0, -1).sort(), ["t2", "t3"]);
+  assert.equal(kills.at(-1), "t1");
+  for (const thread of [live, resolved]) {
+    assert.equal(f.store.record(thread.id).reopenWithProject, true);
+    assert.equal(f.store.record(thread.id).resolved, thread.resolved);
+  }
+  for (const thread of [stopped, unrelated, unowned]) assert.deepEqual(f.store.record(thread.id), thread);
   assert.equal(readFileSync(sessionFile, "utf8"), before);
+  assert.deepEqual(f.store.messages(parent.id), []);
   assert.equal(runs(io).length, 0);
+  assert.deepEqual(await closeThreads(parent, io), { closed: [] }, "the shutdown hook's second cascade is harmless");
+});
+
+test("a crashed coordinator is only observed; its live threads are neither closed nor marked", async t => {
+  const f = fixture(t), io = transport(f), parent = coordinator(f);
+  f.store.patch(parent.id, { registration: "registered", owner: { ...processIdentity(), start: "crashed" }, terminal: "t1" });
+  const child = f.store.patch(f.record.id, { registration: "registered", owner: processIdentity(), terminal: "t2" });
+  io.rows.push({ address: "t1", state: "finished" },
+    { address: "t2", state: "live", pid: process.pid, labels: { "projects.session": child.id } });
+  const catalog = await listSessions({ stateDir: f.stateDir }, io);
+  assert.equal(catalog.sessions.find(row => row.id === parent.id).writer, "dead");
+  assert.equal(catalog.sessions.find(row => row.id === child.id).terminalOwned, true);
+  assert.deepEqual(f.store.record(child.id), child);
+  assert.ok(!io.calls.some(call => call.args[0] === "kill"));
+});
+
+test("coordinator registration restores marked unresolved threads once in its current space, continuing after a failed launch", async t => {
+  for (const space of ["new-space", undefined]) {
+    const f = fixture(t), io = transport(f), parent = coordinator(f);
+    const unmarked = f.store.record(f.record.id);
+    const failed = f.store.save({ ...unmarked, id: randomUUID(), title: "Lost transcript", reopenWithProject: true,
+      transcriptState: "expected", sessionFile: join(f.root, "lost.jsonl"), sessionDir: f.root });
+    const live = f.store.save({ ...unmarked, id: randomUUID(), title: "Restore", reopenWithProject: true });
+    const resolved = f.store.save({ ...unmarked, id: randomUUID(), title: "Resolved", resolved: true, reopenWithProject: true });
+    const sessionFile = join(f.root, "project.jsonl");
+    registerCurrentSession(f.store, { id: parent.id, agent: "pi", cwd: f.projectRoot, owner: processIdentity(),
+      terminal: "t9", space, sessionDir: f.root, sessionFile });
+    io.onRun = row => register(f, row);
+    const result = await reopenProjectThreads(parent, io);
+    assert.deepEqual(result.errors.map(error => error.id), [failed.id]);
+    assert.match(result.errors[0].error, /transcript is missing/);
+    assert.equal(runs(io).length, 1);
+    assert.equal(f.store.record(live.id).registration, "registered");
+    assert.equal(f.store.record(live.id).space, space);
+    assert.equal(io.rows[0].labels["herdr.space"], space);
+    if (space === undefined) assert.ok(!runs(io)[0].args.some(value => value.startsWith("herdr.")));
+    for (const thread of [failed, live, resolved]) assert.equal(f.store.record(thread.id).reopenWithProject, undefined);
+    assert.deepEqual(f.store.record(unmarked.id), unmarked);
+    assert.equal(f.store.record(resolved.id).resolved, true);
+    assert.deepEqual(await reopenProjectThreads(parent, io), { errors: [] });
+    assert.equal(runs(io).length, 1);
+    assert.equal(focuses(io).length, 0);
+  }
+});
+
+test("individual thread opening and resolution consume its project-reopen mark", async t => {
+  const f = fixture(t), io = transport(f);
+  f.store.patch(f.record.id, { reopenWithProject: true });
+  await ensureSession(f.options, io);
+  assert.equal(f.store.record(f.record.id).reopenWithProject, undefined);
+  f.store.patch(f.record.id, { reopenWithProject: true });
+  await resolveSession(f.options);
+  assert.equal(f.store.record(f.record.id).reopenWithProject, undefined);
 });
 
 test("close and list reject reused or unrelated shells even when a writer remains live", async t => {
@@ -571,6 +634,23 @@ test("human external sends reopen resolved threads, notify once and preserve abo
   assert.equal(notice.informational, true);
   assert.deepEqual(f.store.control(f.record.id), { ...control, version: 1 });
   assert.equal(runs(io).length, 0);
+});
+
+test("agent and human sends to a stopped coordinator wait durably, while a stopped thread is launched", async t => {
+  const f = fixture(t), io = transport(f), parent = coordinator(f);
+  f.store.patch(parent.id, { registration: "offline" });
+  for (const kind of ["agent", "human"]) {
+    const sent = await sendMessage({ ...parent, text: `${kind} report`, sender: { kind, title: kind, session: f.record.id } }, io);
+    assert.equal(sent.state, "pending");
+    assert.equal(sent.availability.waiting, true);
+    assert.ok(f.store.messages(parent.id).some(message => message.id === sent.message));
+  }
+  assert.deepEqual(io.calls, [], "sending to the project does not attempt terminal recovery");
+  const sent = await sendMessage({ ...f.options, text: "Work", sender: { kind: "agent", title: "Project", session: parent.id } }, io);
+  assert.equal(sent.state, "pending");
+  assert.equal(f.store.messages(f.record.id)[0].id, sent.message);
+  assert.equal(runs(io).length, 1);
+  assert.equal(io.rows[0].labels["projects.session"], f.record.id);
 });
 
 test("resolved coordinators receive agent reports without reopening, while human input and sends reopen them", async t => {

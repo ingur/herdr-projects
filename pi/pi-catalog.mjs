@@ -24,6 +24,6 @@ export async function listThreads(r, own, io = {}) {
     sourceMessages: sourceReferences(r.ctx.sessionManager.getEntries()),
     sourceNote: "forward takes an entry ID from this session; original text and attribution are recovered in code.",
     inbox: own.map(item => ({ id: item.message.id, ...item.delivery })),
-    guarantee: "recorded means a custom entry is observed in Pi's file, not successful model processing. Uncertain attempts require explicit /projects retry; exactly-once execution is not claimed.",
+    guarantee: "recorded means a custom entry is observed in Pi's file, not successful model processing. An uncertain attempt is redelivered once with a visible repeat warning; another interruption leaves it possibly undelivered. Exactly-once execution is not claimed.",
   };
 }

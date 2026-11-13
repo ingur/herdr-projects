@@ -3,19 +3,11 @@ import { Type } from "typebox";
 import { describeError, renameSchema, sendSchema, startSchema, targetSchema } from "../core/contracts.ts";
 import { toolDescriptions } from "./prompts.mjs";
 import { createSessionRuntime } from "./session.ts";
-import { sessionId } from "../core/lib/state.mjs";
 import { renameThread, reopenThread, resolveThread, sendThread, startThread } from "./threads.ts";
 import { listThreads } from "./pi-catalog.mjs";
 import { dormantHint } from "./registration.mjs";
-import { openProject } from "./open.ts";
-
-const help = [
-  "/projects init [name] (promote this plugin-enabled Pi conversation to a project)",
-  "/projects open [name] (open a stopped project in this terminal)",
-  "/projects (project and thread status)",
-  "/projects resume (resume inbox delivery, not terminal lifetime)",
-  "/projects retry MESSAGE_UUID (explicitly retries an uncertain injection; may duplicate work)",
-].join("\n");
+import { resumeProject } from "./resume.ts";
+import { waitingDelivery } from "../core/messages.mjs";
 
 function result(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], details: value };
@@ -72,13 +64,11 @@ export default function projects(pi: ExtensionAPI) {
   });
 
   const verbs = {
-    init: "turn this conversation into a project",
-    open: "open a stopped project in this terminal",
-    resume: "let waiting messages in again after an abort",
-    retry: "deliver one uncertain message again",
+    new: "make this conversation a project",
+    resume: "resume a stopped project in this terminal",
   };
   pi.registerCommand("projects", {
-    description: "Projects: init, open, status, resume, retry",
+    description: "Project status; new [name] makes this conversation a project; resume [name] resumes a stopped project here",
     getArgumentCompletions: (prefix: string) => {
       const items = Object.entries(verbs).filter(([verb]) => verb.startsWith(prefix)).map(([value, description]) => ({ value, label: value, description }));
       return items.length ? items : null;
@@ -86,32 +76,21 @@ export default function projects(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const [verb = ""] = args.trim().split(/\s+/);
       const body = args.trim().slice(verb.length).trim();
-      if (verb === "open") return openProject(ctx, body);
+      if (verb === "resume") return resumeProject(ctx, body);
+      if (verb && verb !== "new") { ctx.ui.notify(dormantHint, "info"); return; }
       try {
-        if (verb === "init") {
-          const current = await session.init(ctx, body || undefined);
+        if (verb === "new") {
+          const current = await session.promote(ctx, body || undefined);
           if (current) ctx.ui.notify(`Project ${current.title} uses this conversation (${current.id}).`, "info");
           return;
         }
         if (session.independent()) { ctx.ui.notify(dormantHint, "info"); return; }
         const r = session.bound(ctx);
         r.lastInteraction = Date.now();
-        let value: unknown;
-        if (!verb) {
-          value = await listThreads(r);
-          ctx.ui.notify(dormantHint, "info");
-        }
-        else if (verb === "resume" && !body) {
-          session.pause(r, false, "Human /projects resume");
-          value = { paused: r.paused };
-        } else if (verb === "retry") {
-          sessionId(body);
-          const state = session.reconcileDelivery(r).find(item => item.message.id === body);
-          if (!state || state.delivery.state !== "uncertain") throw new Error("Only an uncertain attempt may be retried; visible/recorded messages are never replayed");
-          r.store.mark(r.id, body, { state: "retry-authorized", execution: "unknown" });
-          session.pause(r, false, "Human explicitly authorized retry (possible duplicate work)");
-          value = { message: body, retry: "authorized", warning: "Previous processing is unknown; retry may duplicate work" };
-        } else throw new Error(help);
+        const deliveries = session.reconcileDelivery(r);
+        const waitingMessages = deliveries.filter(item => waitingDelivery(item.delivery)).length;
+        const possiblyUndelivered = deliveries.filter(item => item.delivery.state === "uncertain" && item.delivery.redelivered).length;
+        const value = { ...await listThreads(r), waitingMessages, ...(possiblyUndelivered ? { possiblyUndelivered } : {}) };
         ctx.ui.notify(JSON.stringify(value, null, 2), "info");
       } catch (error) {
         ctx.ui.notify(`Projects: ${describeError(error)}`, !verb && session.independent() ? "info" : "error");

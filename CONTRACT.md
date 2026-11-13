@@ -19,7 +19,7 @@ each thread belongs to one coordinator.
 
 An ordinary session with no record for its Pi UUID is dormant: no footer, notice,
 polling, editor observer or active project tools. `/new`, `/resume` and `/fork`
-remain untouched. `/projects` gives one init/open hint. `/projects init [name]`
+remain untouched. `/projects` gives one new/resume hint. `/projects new [name]`
 promotes the current persistent conversation, retaining its UUID, transcript,
 cwd and terminal. Any local hc terminal works; outside one it explains that an
 hc terminal is needed. `herdr.space` and `herdr.tab` are independent optional
@@ -31,17 +31,32 @@ On every `session_start`, including reload/resume, the adapter looks up the Pi
 session ID across all project records. A match supplies root, role and coordinator;
 no launch-role environment is used. Registration takes both writer locks inside
 the extension. Live or uncertain competing ownership causes a notice and graceful
-Pi shutdown before registration or conversation mutation. Session replacement
-(`/new`, `/resume`, `/fork`, or `ctx.switchSession`) first awaits the same cleanup
-as shutdown: deactivate tools, clear status/editor observation, remove this
-session's terminal labels, mark it offline without a process owner, and release
-both locks. Herdr placement labels stay on the terminal. Pi then loads a fresh
-extension instance, which registers only a matching session UUID. A fork has a
-new UUID and is ordinary, never a second project. `/reload` follows the same
-cleanup/registration path. No lock is taken by an external launcher or held before
-Pi's trust prompt. This is a cooperative local protocol, not an OS security boundary.
+Pi shutdown before registration or conversation mutation. Clean shutdown (`quit`,
+Ctrl+D, SIGHUP/SIGTERM) and session replacement (`/new`, `/resume`, `/fork`, or
+`ctx.switchSession`) close the coordinator's live owned thread terminals through
+core's `close-threads` action. The Pi shutdown hook starts the stable control shim
+detached with ignored stdio, so it outlives Pi or its terminal, and awaits it while
+Pi remains alive to serialize replacement. Each verified live thread is marked
+`reopenWithProject: true` before closing; already-stopped or unowned threads are
+not marked. Closing changes neither resolution nor conversation data and sends
+no per-thread closed notices. A crash without clean shutdown cascades nothing.
 
-`/projects open [name]` lists stopped Pi coordinators across the state directory,
+Cleanup deactivates tools, clears status/editor observation, removes this session's
+terminal labels, marks it offline without a process owner, and releases both locks.
+Herdr placement labels stay on the terminal. Pi then loads a fresh extension
+instance, which registers only a matching session UUID. A fork has a new UUID and
+is ordinary, never a second project. `/reload` cleans up and registers again without
+closing threads. No lock is taken by an external launcher or held before Pi's
+trust prompt. This is a cooperative local protocol, not an OS security boundary.
+
+Every coordinator registration (sidebar, `/projects resume`, or plain Pi resume)
+uses the existing ensure path to reopen marked, unresolved threads without focus.
+They use the project's current space, or no placement when it has no space.
+The mark is consumed once per thread, including a failed relaunch; failures are
+reported once without blocking the other threads or the project. Individual
+thread opening/registration, resolution and deletion also clear the mark.
+
+`/projects resume [name]` lists stopped Pi coordinators across the state directory,
 excluding this session and live/uncertain writers. Existing observation,
 registration and creation timestamps order most-recently-used first; resolved
 projects come last. The native filterable picker shows title and folder. A unique
@@ -72,6 +87,7 @@ Optional lifecycle/binding fields:
 - `owner`: PID, platform start time, boot identity, process state and lock token.
 - `initial`: message held until its recipient registers.
 - Pi's observed `sessionFile`, `sessionDir`, and `transcriptState` (`expected` or `unwritten`).
+- `reopenWithProject`: a thread closed with its coordinator awaits one reopening.
 
 Transcripts remain in Pi's normal session location and are visible in `/resume`.
 Registration records the file and directory reported by Pi. An unwritten UUID
@@ -121,7 +137,8 @@ A new adapter must implement the complete boundary, not just supply a command:
    injection; reconcile receipts honestly. Use `projectDir/inboxes/<id>/<message>.json`,
    `deliveries/<id>/<message>.json`, and `controls/<id>.json`.
    Controls are `{version:1, paused, reason?, at?}`; deliveries contain `version:1`,
-   `state`, `execution` and optional attempt time/entry ID.
+   `state`, `execution`, optional attempt time/entry ID, and `redelivered: true`
+   once the automatic second delivery attempt has begun.
 7. Use the copied process helpers. Linux identity is PID + `/proc` start ticks +
    boot ID. macOS is PID + UTC `ps lstart` second + `kern.bootsessionuuid`; reuse
    within one second cannot be distinguished without native OS access. Unknown
@@ -183,13 +200,22 @@ an authentication boundary.
   ownership blocks it. No launch, terminal move or child-record rewrite.
 - `rename {projectRoot,id,title,by?}` defaults to human authorship. `order
   {projectRoot,id,rank}` persists a finite numeric rank. Neither launches work.
-- `send {projectRoot,id,text,note?,sender:{kind,title,session?}}` publishes durably,
-  then ensures availability. Recovery failure does not discard the message.
-  Text/note limits are 1–100000 characters. Agent sends to resolved threads
-  require explicit reopen; human sends reopen resolved recipients.
-- `close {projectRoot,id}` kills only the verified owned terminal, retaining
-  transcript, registry, inbox and children. Closing a parent also stops its
-  running subagents; unrelated live shells are never killed.
+- `send {projectRoot,id,text,note?,sender:{kind,title,session?}}` publishes durably.
+  Thread recipients are ensured; recovery failure does not discard the message.
+  Coordinator recipients are never launched by sends, including human-kind sends.
+  A stopped coordinator returns accepted-and-waiting (`availability.waiting: true`);
+  delivery waits until the human resumes the project. Text/note limits are
+  1–100000 characters. Agent sends to resolved threads require explicit reopen;
+  human sends clear resolution but do not launch a stopped coordinator.
+- `close {projectRoot,id}` kills only verified owned terminals, retaining
+  transcripts, registry and inboxes. A coordinator first runs `close-threads`.
+  Closing a terminal also stops its running subagents; unrelated live shells are
+  never killed.
+- `close-threads {projectRoot,id:coordinator}` closes all of that coordinator's
+  verified live owned threads, marking them `reopenWithProject: true`. Stopped or
+  unowned threads are left alone; no resolution, deletion or lifecycle notices.
+  Returns `{closed:[threadIds]}`. Failures are collected after attempting the other
+  threads and reported as an error. Repeated calls leave already-closed threads alone.
 - `delete {projectRoot,id}` is not exposed as an agent tool (not access-controlled).
   It closes verified live terminals, waits for dead writers, takes all locks,
   deletes the validated conversation and transport, then removes the record last.
@@ -218,26 +244,32 @@ hops while preserving exact text and original authorship. Attachment-bearing
 entries cannot be forwarded as if they were text. Publication is idempotent only
 for identical ID/content; conflicting content is rejected.
 
-Delivery distinguishes pending, attempting, visible-not-durable, recorded,
-uncertain and explicit retry authorization. A receipt is not completed work;
-exactly-once execution is not claimed. Uncertain attempts never replay silently.
-Pi's synchronous append/rollback semantics let visible entries plus an existing
-session file establish durable receipt; the adapter does not reread the transcript
-on every tick.
+Delivery distinguishes pending, attempting, visible-not-durable, recorded and
+uncertain. At the next safe delivery opportunity, an uncertain attempt is
+automatically redelivered exactly once with a short visible transport note that
+it may repeat a message delivered before an interruption. `redelivered: true` is
+persisted before that attempt and retained through receipts; another interrupted
+attempt is never redelivered again and `/projects` reports it as possibly
+undelivered. A receipt is not completed work; exactly-once execution is not
+claimed. Pi's synchronous append/rollback semantics let visible entries plus an
+existing session file establish durable receipt; the adapter does not reread the
+transcript on every tick.
 
 Project messages, including initial instructions and queued inbox messages, wake
 normally after start, reopen and reload; no first human prompt is required.
 Delivery still requires a selected model and a quiet idle boundary: no draft,
 pending input, open prompt, active turn or pause. Opening a session never clears
 an existing abort pause. Esc/Ctrl+C while idle pauses nothing; an aborted settled
-run pauses delivery, and human input or explicit resume releases that pause.
-Informational notices never request turns. Replayed subagent completions follow
+run pauses delivery until the human's next prompt. Informational notices never
+request turns. Replayed subagent completions follow
 the separate subagent extension's wake policy; `/reload` stops its running children.
 
 Tools (`thread_start`, `thread_list`, `thread_send`, `thread_rename`,
 `thread_resolve`, `thread_reopen`) register with `defaultActive:false` and activate
-only after registration, preserving other tools. `/projects` supports `init`,
-`open [name]`, `resume`, `retry MESSAGE_UUID`, and status. Native `/name` is human-authored.
+only after registration, preserving other tools. The only commands are `/projects`
+(status, including this session's waiting-message count), `/projects new [name]`,
+and `/projects resume [name]`. Unknown words show the one-line usage hint; there
+are no aliases or delivery-control commands. Native `/name` is human-authored.
 Human prompts reopen resolved sessions; after a human turn, only a thread resolved
 by a different identified agent is reopened. Self/human resolution is retained.
 

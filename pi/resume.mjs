@@ -26,6 +26,6 @@ export function changedWorkingFolder(folder, terminalFolder) {
 
 export function projectConversation(record) {
   const file = checkedSessionFile(record);
-  if (!file) throw Object.assign(new Error("This project has no saved conversation yet; start Pi with --session-id " + record.id + " in " + displayFolder(record.cwd) + " to open it."), { code: "ENOSESSIONFILE" });
+  if (!file) throw Object.assign(new Error("This project has no saved conversation yet; start Pi with --session-id " + record.id + " in " + displayFolder(record.cwd) + " to resume it."), { code: "ENOSESSIONFILE" });
   return file;
 }

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { acquireLock, readJSON, sessionId } from "../core/lib/state.mjs";
@@ -8,7 +9,7 @@ import { checkedSessionFile } from "./pi-launch.mjs";
 import { clearControlDescriptor } from "../core/control.mjs";
 
 export const PROJECT_TOOLS = ["thread_start", "thread_list", "thread_send", "thread_rename", "thread_resolve", "thread_reopen"];
-export const dormantHint = "Use /projects init [name] to make this conversation a project, or /projects open [name] to open one here.";
+export const dormantHint = "Use /projects for status, /projects new [name] to make this conversation a project, or /projects resume [name] to resume one here.";
 
 export function findSessionRecord(stateDir, id) {
   sessionId(id);
@@ -81,7 +82,7 @@ export function registerCurrentSession(store, binding) {
       cwd: binding.cwd, terminal: binding.terminal, space: binding.space, tab: binding.tab,
       sessionFile: binding.sessionFile, sessionDir: binding.sessionDir, owner: binding.owner, resolved: previous?.resolved === true,
       transcriptState: previous?.transcriptState === "expected" || existsSync(binding.sessionFile) ? "expected" : "unwritten", created, rank,
-      launchState: "registered", launchError: undefined, registration: "registered", registered: now.toISOString() };
+      launchState: "registered", launchError: undefined, registration: "registered", registered: now.toISOString(), reopenWithProject: undefined };
     checkedSessionFile(record);
     return store.save(record);
   });
@@ -105,4 +106,19 @@ export async function releaseSessionRegistration(binding, io = {}) {
     try { unregisterCurrentSession(binding.store, binding); }
     finally { for (const lock of binding.locks.toReversed()) lock.release(); }
   }
+}
+
+export async function shutdownProjectThreads(binding, reason) {
+  if (binding.role !== "coordinator" || reason === "reload") return;
+  const { stateDir, projectRoot, id } = binding;
+  // Detached with no terminal pipes: a disappearing Pi/PTY cannot interrupt the cascade.
+  const child = spawn(join(stateDir, "bin", "control"), ["close-threads", JSON.stringify({ stateDir, projectRoot, id })],
+    { detached: true, stdio: "ignore" });
+  const finished = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => code === 0 ? resolve() : reject(new Error(`Project thread close failed (${signal ?? code})`)));
+  });
+  child.unref();
+  // Await completion while Pi is alive so replacement cannot race the old cascade.
+  return finished;
 }
