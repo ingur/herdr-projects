@@ -96,11 +96,12 @@ export default function projects(pi: ExtensionAPI) {
     bound = undefined;
   }
 
-  async function promote(ctx: ExtensionCommandContext, name: string) {
+  // `id` set: a project closed before its first turn has no conversation to switch to, and takes this one.
+  async function promote(ctx: ExtensionCommandContext, name: string, id?: string) {
     const stateDir = stateDirectory();
     if (bound || piRecord(stateDir, "sessionId", ctx.sessionManager.getSessionId())) throw new Error("This conversation is already in a project.");
     if (!ctx.sessionManager.getSessionFile()) throw new Error("Projects needs a saved Pi session; do not use --no-session.");
-    const view = await actions.register({ title: name || pi.getSessionName(), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx, stateDir), terminal: process.env.HC_TERMINAL_ID, pid: process.pid });
+    const view = await actions.register({ ...(id ? { id } : { title: name || pi.getSessionName() }), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx, stateDir), terminal: process.env.HC_TERMINAL_ID, pid: process.pid });
     bind(stateDir, view);
     ctx.ui.notify(`Project ${view.title} uses this conversation.`, "info");
   }
@@ -229,8 +230,14 @@ export default function projects(pi: ExtensionAPI) {
       if (ctx.mode !== "tui" || !process.env.HC_TERMINAL_ID) {
         return ctx.ui.notify(`Projects needs interactive Pi in an hc terminal. Open one with hc, run pi there, then use /projects ${verb}.`, "error");
       }
-      if (verb === "resume") return resumeProject(ctx, body);
-      try { await promote(ctx, body); }
+      try {
+        if (verb === "resume") {
+          const unsaved = await resumeProject(ctx, body);
+          if (unsaved) await promote(ctx, "", unsaved);
+          return;
+        }
+        await promote(ctx, body);
+      }
       catch (error) { ctx.ui.notify(`Projects: ${message(error)}`, "error"); }
     },
   });

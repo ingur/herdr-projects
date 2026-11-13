@@ -53,7 +53,8 @@ function pickProject(ctx: ExtensionCommandContext, candidates: Project[], query:
 }
 
 // Switching starts a fresh Pi session; its session_start registers the project in this terminal.
-export async function resumeProject(ctx: ExtensionCommandContext, query: string) {
+// Returns the id of a project that has no saved conversation, for the caller to bind here.
+export async function resumeProject(ctx: ExtensionCommandContext, query: string): Promise<string | undefined> {
   let file: string;
   try {
     const { sessions } = await actions.list({});
@@ -63,7 +64,10 @@ export async function resumeProject(ctx: ExtensionCommandContext, query: string)
     const selected = matchProject(candidates, query) ?? await pickProject(ctx, candidates, query);
     if (!selected) return;
     file = readRecord(stateDirectory(), selected.id)?.adapter?.sessionFile;
-    if (!file || !existsSync(file)) throw new Error("This project has no saved conversation yet.");
+    if (!file || !existsSync(file)) {
+      if (existsSync(selected.cwd) && realpathSync(ctx.cwd) === realpathSync(selected.cwd)) return selected.id;
+      throw new Error(`This project has no saved conversation yet. Start Pi in ${displayFolder(selected.cwd)} and resume it there.`);
+    }
   } catch (error) {
     ctx.ui.notify(`Projects: ${error instanceof Error ? error.message : String(error)}`, "error");
     return;
