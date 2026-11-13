@@ -1,10 +1,10 @@
 # herdr-projects
 
-A [Pi](https://pi.dev) extension for long-running projects in [herdr](https://herdr.dev) terminals.
+Long-running projects for coding agents in [herdr](https://herdr.dev) terminals. A project is one agent session that coordinates: it starts threads, which are other sessions that keep running on their own, that you can open and talk to, and that report back.
 
-A project is one Pi session that coordinates. It can start threads: other Pi sessions that keep running on their own, that you can open and talk to directly, and that report back.
+Works with [Pi](https://pi.dev) today. Other agents can plug in through [CONTRACT.md](CONTRACT.md).
 
-## Install
+## Install (Pi)
 
 ```sh
 pi install git:github.com/ingur/herdr-projects
