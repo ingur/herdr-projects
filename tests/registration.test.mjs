@@ -6,10 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { processIdentity } from "../core/lib/process.mjs";
-import { atomicJSON } from "../core/lib/state.mjs";
-import { acquireSessionLocks, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, sessionSwitchDecision, unregisterCurrentSession } from "../pi/registration.mjs";
+import { atomicJSON, lockState } from "../core/lib/state.mjs";
+import { acquireSessionLocks, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, releaseSessionRegistration, unregisterCurrentSession } from "../pi/registration.mjs";
 import { checkedSessionFile, piLaunchCommand } from "../pi/pi-launch.mjs";
 import { Store, stateDirectory } from "../core/store.mjs";
+import { listSessions } from "../core/control.mjs";
 
 function fixture(t) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "project-registration-")));
@@ -26,13 +27,11 @@ function fixture(t) {
   return { root, store, binding, stateDir, projectRoot, transcript };
 }
 
-test("unregistered sessions remain dormant without creating state or blocking switches", t => {
+test("unregistered sessions remain dormant without creating state", t => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "project-dormant-"))), state = join(root, "missing");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   assert.equal(findSessionRecord(state, randomUUID()), undefined);
   assert.equal(existsSync(state), false);
-  assert.equal(sessionSwitchDecision(false), undefined);
-  assert.deepEqual(sessionSwitchDecision(true), { cancel: true });
   assert.equal(stateDirectory(join(root, "selected")), join(root, "selected"));
   assert.throws(() => stateDirectory("relative"), /absolute/);
 });
@@ -107,4 +106,54 @@ test("initial and queued project messages request turns without a human prompt; 
   assert.equal(messageNeedsTurn({ text: "Initial thread instruction" }), true);
   assert.equal(messageNeedsTurn({ text: "Queued before reopen or reload", informational: false }), true);
   assert.equal(messageNeedsTurn({ informational: true }), false);
+});
+
+test("replacement releases the old live-process registration and labels; a fork stays ordinary and resume rebinds placement", async t => {
+  const f = fixture(t), locks = acquireSessionLocks(f.stateDir, f.store, f.binding.id);
+  registerCurrentSession(f.store, { ...f.binding, owner: locks[0].owner, promote: true, space: "old-space", tab: "old-tab" });
+  const row = { address: "t1", state: "live", pid: process.pid, labels: {
+    "projects.session": f.binding.id, "projects.project": f.store.directory.split("/").pop(),
+    "projects.control": "descriptor", "projects.launch": "claim", "herdr.space": "old-space", "herdr.tab": "old-tab" } };
+  const io = { command: async (_program, args) => {
+    if (args[0] === "ls") return { terminals: [row] };
+    if (args[0] === "label") {
+      assert.equal(lockState(join(f.stateDir, "writer-locks", f.binding.id)), "live", "hold ownership through label cleanup");
+      for (const arg of args.slice(3)) { assert.ok(arg.endsWith("=")); delete row.labels[arg.slice(0, -1)]; }
+    }
+    return row;
+  } };
+  await releaseSessionRegistration({ ...f.binding, stateDir: f.stateDir, projectRoot: f.projectRoot, store: f.store, locks }, io);
+  assert.equal(lockState(join(f.stateDir, "writer-locks", f.binding.id)), "dead");
+  assert.equal(lockState(join(f.store.directory, "locks", `extension-${f.binding.id}`)), "dead");
+  const stopped = f.store.record(f.binding.id);
+  assert.equal(stopped.registration, "offline");
+  assert.equal(stopped.owner, undefined);
+  assert.ok(stopped.observed);
+  const view = (await listSessions({ stateDir: f.stateDir }, io)).sessions[0];
+  assert.equal(view.writer, "dead", "the old process still lives but no longer owns this session");
+  assert.equal(view.terminalOwned, false);
+  assert.deepEqual(row.labels, { "herdr.space": "old-space", "herdr.tab": "old-tab" });
+  const forkId = randomUUID();
+  assert.equal(findSessionRecord(f.stateDir, forkId), undefined);
+  assert.equal(registerCurrentSession(f.store, { ...f.binding, id: forkId }), undefined);
+  assert.equal(f.store.records().length, 1);
+  const resumedLocks = acquireSessionLocks(f.stateDir, f.store, f.binding.id);
+  try {
+    const resumed = registerCurrentSession(f.store, { ...f.binding, owner: resumedLocks[0].owner, terminal: "t2", space: "new-space", tab: "new-tab" });
+    assert.equal(resumed.space, "new-space");
+    assert.equal(resumed.tab, "new-tab");
+    assert.equal(resumed.terminal, "t2");
+  } finally { for (const lock of resumedLocks.reverse()) lock.release(); }
+  assert.equal(readFileSync(f.binding.sessionFile, "utf8"), f.transcript);
+});
+
+test("failed label cleanup still saves an offline record and releases both writer locks", async t => {
+  const f = fixture(t), locks = acquireSessionLocks(f.stateDir, f.store, f.binding.id);
+  registerCurrentSession(f.store, { ...f.binding, owner: locks[0].owner, promote: true });
+  await assert.rejects(releaseSessionRegistration({ ...f.binding, stateDir: f.stateDir, projectRoot: f.projectRoot, store: f.store, locks },
+    { command: async () => { throw new Error("transport unavailable"); } }), /transport unavailable/);
+  assert.equal(f.store.record(f.binding.id).registration, "offline");
+  assert.equal(f.store.record(f.binding.id).owner, undefined);
+  const next = acquireSessionLocks(f.stateDir, f.store, f.binding.id);
+  for (const lock of next.reverse()) lock.release();
 });

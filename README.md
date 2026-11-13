@@ -26,6 +26,7 @@ Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://
 | --- | --- |
 | `/projects` | status |
 | `/projects init [name]` | turn this session into a project |
+| `/projects open [name]` | open a stopped project in this terminal |
 | `/projects resume` | let waiting messages in again after you pressed Esc |
 | `/projects retry ID` | deliver one uncertain message again |
 

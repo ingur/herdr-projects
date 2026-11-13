@@ -50,7 +50,7 @@ function notice(store, record, action, previousTitle) {
 function writerState(stateDir, directory, record, snapshot) {
   const states = [lockState(join(stateDir, "writer-locks", record.id), snapshot), lockState(join(directory, "locks", `extension-${record.id}`), snapshot)];
   if (record.owner) states.push(ownerState(record.owner, snapshot));
-  else if (record.registration !== "awaiting-extension") states.push("unknown");
+  else if (!["awaiting-extension", "offline"].includes(record.registration)) states.push("unknown");
   return states.includes("live") ? "live" : states.includes("unknown") ? "unknown" : "dead";
 }
 function view(stateDir, directory, record, rows, observationError, snapshot) {
@@ -66,6 +66,7 @@ function view(stateDir, directory, record, rows, observationError, snapshot) {
     id: record.id, projectRoot: record.projectRoot, title: record.title, role: record.role, coordinator: record.coordinator, agent: record.agent,
     cwd: record.cwd, space: record.space, tab: record.tab, terminal: record.terminal, resolved: record.resolved ?? false,
     rank: record.rank ?? (Date.parse(record.created) || 0),
+    created: record.created, registered: record.registered, observed: record.observed,
     registration: record.registration, writer: snapshot === false ? "unknown" : writerState(stateDir, directory, record, snapshot), paused,
     terminalState: rows ? observed?.state ?? "not-observed" : "unknown", terminalOwned: snapshot !== false && !!observed && !!ownership(stateDir, directory, record, observed, snapshot), launchState: record.launchState,
     ...(error ? { error } : {}),
@@ -139,6 +140,18 @@ export async function publishControlDescriptor(options, io = {}) {
     `projects.session=${record.id}`, `projects.project=${store.directory.split("/").pop()}`, `projects.control=${JSON.stringify(descriptor)}`]));
   if (labelled.address !== record.terminal || labelled.labels?.["projects.control"] !== JSON.stringify(descriptor)) throw new Error("hc did not retain the control descriptor");
   return descriptor;
+}
+
+export async function clearControlDescriptor(options, io = {}) {
+  const { record } = open(options);
+  const call = io.command ?? command;
+  const observed = terminal(await call("hc", ["get", record.terminal, "--json"]));
+  if (observed.address !== record.terminal || observed.labels?.["projects.session"] !== record.id) return;
+  if (observed.state !== "live") return;
+  if (!descendsFrom(record.owner, observed.pid)) throw new Error("Cannot clear an unverified session terminal");
+  const keys = ["projects.session", "projects.project", "projects.control", "projects.launch"];
+  const cleared = terminal(await call("hc", ["label", record.terminal, "--json", ...keys.map(key => `${key}=`)]));
+  if (cleared.address !== record.terminal || keys.some(key => cleared.labels?.[key] !== undefined)) throw new Error("hc did not clear the session labels");
 }
 
 export async function createCoordinator(options, io = {}) {

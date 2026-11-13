@@ -19,22 +19,39 @@ each thread belongs to one coordinator.
 
 An ordinary session with no record for its Pi UUID is dormant: no footer, notice,
 polling, editor observer or active project tools. `/new`, `/resume` and `/fork`
-remain untouched. `/projects` gives one init hint. `/projects init [name]` promotes
-the current persistent conversation, retaining its UUID, transcript, cwd and
-terminal. Any local hc terminal works; outside one it explains that an hc terminal
-is needed. `herdr.space` and `herdr.tab` are independent optional presentation
-labels, not prerequisites. Unplaced sessions have no space/tab and launch with
-no Herdr placement labels. They remain reachable with `hc attach` and may appear
-as background agents when Herdr is open.
+remain untouched. `/projects` gives one init/open hint. `/projects init [name]`
+promotes the current persistent conversation, retaining its UUID, transcript,
+cwd and terminal. Any local hc terminal works; outside one it explains that an
+hc terminal is needed. `herdr.space` and `herdr.tab` are independent optional
+presentation labels, not prerequisites. Sessions without placement launch with
+no Herdr placement labels and remain reachable with `hc attach`. Core retains
+their records; it defines no "Unplaced" UI group.
 
 On every `session_start`, including reload/resume, the adapter looks up the Pi
 session ID across all project records. A match supplies root, role and coordinator;
 no launch-role environment is used. Registration takes both writer locks inside
 the extension. Live or uncertain competing ownership causes a notice and graceful
-Pi shutdown before registration or conversation mutation. While registered,
-session replacement is cancelled with a message to use a new terminal; `/reload`
-is supported. No lock is taken by an external launcher or held before Pi's trust
-prompt. This is a cooperative local protocol, not an OS security boundary.
+Pi shutdown before registration or conversation mutation. Session replacement
+(`/new`, `/resume`, `/fork`, or `ctx.switchSession`) first awaits the same cleanup
+as shutdown: deactivate tools, clear status/editor observation, remove this
+session's terminal labels, mark it offline without a process owner, and release
+both locks. Herdr placement labels stay on the terminal. Pi then loads a fresh
+extension instance, which registers only a matching session UUID. A fork has a
+new UUID and is ordinary, never a second project. `/reload` follows the same
+cleanup/registration path. No lock is taken by an external launcher or held before
+Pi's trust prompt. This is a cooperative local protocol, not an OS security boundary.
+
+`/projects open [name]` lists stopped Pi coordinators across the state directory,
+excluding this session and live/uncertain writers. Existing observation,
+registration and creation timestamps order most-recently-used first; resolved
+projects come last. The native filterable picker shows title and folder. A unique
+case-insensitive exact title, otherwise a unique substring, opens directly;
+other text pre-filters the picker. Opening switches to the validated recorded
+conversation in this terminal and registers its current space/tab (or neither).
+Pi rebuilds its runtime and tools in the conversation's own cwd, including across
+folders; a fresh replacement context announces that folder when it differs from
+the terminal's launch directory. Unwritten conversations are explained with the
+UUID/folder needed to start them; no transcript or new identity is fabricated.
 
 ## Schema version 1
 
@@ -84,9 +101,10 @@ A new adapter must implement the complete boundary, not just supply a command:
 2. Use `core/lib/state.mjs`'s exact lock protocol. The running adapter holds
    `stateDir/writer-locks/<id>` and `projectDir/locks/extension-<id>` for its
    lifetime, records their process identity, and releases only its own generation.
-   Save an offline observation on shutdown before release. Live/unknown owners
-   block recovery and deletion. Incomplete writes get one second of grace;
-   reclamation removes observed filenames, never a racing replacement directory.
+   Save an offline observation and clear the process owner on shutdown or
+   replacement before release. Live/unknown owners block recovery and deletion.
+   Incomplete writes get one second of grace; reclamation removes observed
+   filenames, never a racing replacement directory.
 3. Verify the local live hc address. Registered ownership requires the adapter
    process to descend from hc's terminal PID; project/session labels must not
    conflict. Before registration, a starting terminal is owned only when its
@@ -157,9 +175,10 @@ an authentication boundary.
   project-relative directories, including outside the project.
 - `ensure` and `show {projectRoot,id,space?}` recover only the same conversation.
   Live sessions ignore requested placement. Stopped threads follow their
-  coordinator's verified live or recorded placement; others retain their own.
-  A placed session gets a tab ID if missing. `show` returns `readyToFocus`;
-  the caller, not core, focuses it. Neither operation resumes paused work.
+  coordinator's verified live or current recorded placement, including no space
+  after an unplaced registration; others retain their own. A placed session gets
+  a tab ID if missing. `show` returns `readyToFocus`; the caller, not core, focuses
+  it. Neither operation resumes paused work.
 - `place {projectRoot,id,space}` rehomes only a stopped session; uncertain/live
   ownership blocks it. No launch, terminal move or child-record rewrite.
 - `rename {projectRoot,id,title,by?}` defaults to human authorship. `order
@@ -182,10 +201,13 @@ an authentication boundary.
 
 Session views include identity/title/role/coordinator/agent/cwd, optional space/tab/
 terminal, resolved/rank/registration/writer/paused/terminalState/terminalOwned/
-launchState, and optional error. The Herdr sidebar depends only on the descriptor
+launchState, optional created/registered/observed timestamps, and optional error.
+The Herdr sidebar depends only on the descriptor
 and actions, not registry files. `projects.project` is the project-root hash;
 `projects.launch` is a unique launch token. `projects.rank` is UI-owned for
-independent terminals only. Missing placement belongs under Unplaced.
+independent terminals only. Core records no UI grouping for missing placement;
+the sidebar lists only sessions belonging to an existing space, retaining all
+records, conversations and threads when their space is gone.
 
 ## Delivery and Pi composition
 
@@ -215,7 +237,7 @@ the separate subagent extension's wake policy; `/reload` stops its running child
 Tools (`thread_start`, `thread_list`, `thread_send`, `thread_rename`,
 `thread_resolve`, `thread_reopen`) register with `defaultActive:false` and activate
 only after registration, preserving other tools. `/projects` supports `init`,
-`resume`, `retry MESSAGE_UUID`, and status. Native `/name` is human-authored.
+`open [name]`, `resume`, `retry MESSAGE_UUID`, and status. Native `/name` is human-authored.
 Human prompts reopen resolved sessions; after a human turn, only a thread resolved
 by a different identified agent is reopened. Self/human resolution is retained.
 

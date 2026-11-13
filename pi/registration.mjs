@@ -5,9 +5,10 @@ import { ownerState } from "../core/lib/process.mjs";
 import { projectDirectory } from "../core/store.mjs";
 import { agentKind } from "../core/agent-runtimes.mjs";
 import { checkedSessionFile } from "./pi-launch.mjs";
+import { clearControlDescriptor } from "../core/control.mjs";
 
 export const PROJECT_TOOLS = ["thread_start", "thread_list", "thread_send", "thread_rename", "thread_resolve", "thread_reopen"];
-export const dormantHint = "Use /projects init [name] in an hc terminal to make this conversation a project.";
+export const dormantHint = "Use /projects init [name] to make this conversation a project, or /projects open [name] to open one here.";
 
 export function findSessionRecord(stateDir, id) {
   sessionId(id);
@@ -25,10 +26,6 @@ export function findSessionRecord(stateDir, id) {
     found = record;
   }
   return found;
-}
-
-export function sessionSwitchDecision(registered) {
-  return registered ? { cancel: true } : undefined;
 }
 
 export function messageNeedsTurn(message) {
@@ -98,5 +95,14 @@ export function observeTranscript(store, { id, sessionFile }) {
 
 export function unregisterCurrentSession(store, { id, sessionFile }) {
   observeTranscript(store, { id, sessionFile });
-  return store.patch(id, { registration: "offline", observed: new Date().toISOString() });
+  return store.patch(id, { registration: "offline", owner: undefined, observed: new Date().toISOString() });
+}
+
+// Shutdown is also Pi's replacement boundary; release ownership while this process stays alive.
+export async function releaseSessionRegistration(binding, io = {}) {
+  try { await clearControlDescriptor(binding, io); }
+  finally {
+    try { unregisterCurrentSession(binding.store, binding); }
+    finally { for (const lock of binding.locks.toReversed()) lock.release(); }
+  }
 }

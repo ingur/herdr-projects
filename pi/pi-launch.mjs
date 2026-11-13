@@ -6,6 +6,8 @@ import { StringDecoder } from "node:string_decoder";
 import { canonicalPath, checkedStatePath, sessionId } from "../core/lib/state.mjs";
 
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+// Original argv and relative PATH entries belong to the launching process, not a resumed session's cwd.
+export const launchCwd = process.cwd();
 
 function pathExecutable(name, path) {
   for (const directory of (path ?? "").split(delimiter)) {
@@ -28,7 +30,7 @@ function matchingPi(path, execPath, entry) {
   } catch { return false; }
 }
 
-export function capturePiCommand({ execPath = process.execPath, execArgv = process.execArgv, argv = process.argv, env = process.env, cwd = process.cwd() } = {}) {
+export function capturePiCommand({ execPath = process.execPath, execArgv = process.execArgv, argv = process.argv, env = process.env, cwd = launchCwd } = {}) {
   const override = env.PI_PROJECTS_PI_COMMAND;
   const command = override !== undefined ? JSON.parse(override)
     : !execArgv.length && matchingPi((env.PATH ?? "").split(delimiter).map(path => resolve(cwd, path || ".")).join(delimiter), execPath, argv[1]) ? ["pi"]

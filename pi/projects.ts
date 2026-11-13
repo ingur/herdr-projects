@@ -7,9 +7,11 @@ import { sessionId } from "../core/lib/state.mjs";
 import { renameThread, reopenThread, resolveThread, sendThread, startThread } from "./threads.ts";
 import { listThreads } from "./pi-catalog.mjs";
 import { dormantHint } from "./registration.mjs";
+import { openProject } from "./open.ts";
 
 const help = [
   "/projects init [name] (promote this plugin-enabled Pi conversation to a project)",
+  "/projects open [name] (open a stopped project in this terminal)",
   "/projects (project and thread status)",
   "/projects resume (resume inbox delivery, not terminal lifetime)",
   "/projects retry MESSAGE_UUID (explicitly retries an uncertain injection; may duplicate work)",
@@ -70,10 +72,11 @@ export default function projects(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("projects", {
-    description: "Projects: status, init, resume, retry",
+    description: "Projects: init, open, status, resume, retry",
     handler: async (args, ctx) => {
       const [verb = ""] = args.trim().split(/\s+/);
       const body = args.trim().slice(verb.length).trim();
+      if (verb === "open") return openProject(ctx, body);
       try {
         if (verb === "init") {
           const current = await session.init(ctx, body || undefined);
@@ -84,7 +87,10 @@ export default function projects(pi: ExtensionAPI) {
         const r = session.bound(ctx);
         r.lastInteraction = Date.now();
         let value: unknown;
-        if (!verb) value = await listThreads(r);
+        if (!verb) {
+          value = await listThreads(r);
+          ctx.ui.notify(dormantHint, "info");
+        }
         else if (verb === "resume" && !body) {
           session.pause(r, false, "Human /projects resume");
           value = { paused: r.paused };

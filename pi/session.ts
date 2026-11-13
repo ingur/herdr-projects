@@ -12,7 +12,7 @@ import { LOCAL_TERMINAL, terminalPlacement } from "../core/hc.mjs";
 import { command } from "./threads.ts";
 import { publishControlDescriptor, renameSession, reopenSession } from "../core/control.mjs";
 import { observeEditor } from "./interaction.ts";
-import { PROJECT_TOOLS, acquireSessionLocks, dormantHint, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, sessionSwitchDecision, unregisterCurrentSession } from "./registration.mjs";
+import { PROJECT_TOOLS, acquireSessionLocks, dormantHint, findSessionRecord, isWriterConflict, messageNeedsTurn, observeTranscript, registerCurrentSession, releaseSessionRegistration } from "./registration.mjs";
 import { writeLaunchShims } from "./pi-launch.mjs";
 
 export function createSessionRuntime(pi: ExtensionAPI) {
@@ -39,15 +39,12 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     r.paused = paused;
   }
 
-  // Undo a saved registration: editor observation, an honest offline record, then the writer locks.
-  function unregister(r: Runtime) {
-    r.editor?.release();
-    try {
-      unregisterCurrentSession(r.store, { id: r.id, sessionFile: r.sessionFile });
-    } finally { for (const lock of r.locks.reverse()) lock.release(); }
+  async function unregister(r: Runtime) {
+    try { r.editor?.release(); }
+    finally { await releaseSessionRegistration(r); }
   }
 
-  function cleanup() {
+  async function cleanup(ctx: ExtensionContext) {
     generation++;
     pi.setActiveTools(pi.getActiveTools().filter(name => !PROJECT_TOOLS.includes(name)));
     humanTurn = false;
@@ -58,8 +55,8 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     const r = runtime;
     runtime = undefined;
     if (!r) return;
-    r.ctx.ui.setStatus("projects", undefined);
-    unregister(r);
+    ctx.ui.setStatus("projects", undefined);
+    await unregister(r);
   }
 
   function receipts(r: Runtime) {
@@ -150,7 +147,7 @@ export function createSessionRuntime(pi: ExtensionAPI) {
       if (runtime.role !== "coordinator") throw new Error("This conversation is already registered as a thread");
       return bound(ctx);
     }
-    cleanup();
+    await cleanup(ctx);
     const currentGeneration = generation;
     const locks: Runtime["locks"] = [];
     let registered: Runtime | undefined; // saved as registered but not yet live
@@ -186,12 +183,12 @@ export function createSessionRuntime(pi: ExtensionAPI) {
         promptOpen: 0, lastInteraction: Date.now(), inFlight: false, wakeAt: 0, recorded: new Map() };
       registered = r;
       await publishControlDescriptor({ stateDir, projectRoot, id });
-      if (generation !== currentGeneration) { unregister(r); return; }
+      if (generation !== currentGeneration) { await unregister(r); return; }
       r.editor = observeEditor(ctx);
       runtime = r;
       pi.setActiveTools([...new Set([...pi.getActiveTools(), ...PROJECT_TOOLS])]);
       if (ctx.sessionManager.getSessionName() !== record.title) setSessionName(r, record.title);
-      failure = "Session changed; use a new terminal for another conversation";
+      failure = dormantHint;
       // A launch claim alone never sends the initial instruction: only this registered recipient can.
       store.publishInitial(id);
       unsubscribe = ctx.ui.onTerminalInput(() => {
@@ -206,10 +203,10 @@ export function createSessionRuntime(pi: ExtensionAPI) {
       return r;
     } catch (error) {
       if (generation !== currentGeneration) {
-        if (registered) unregister(registered); else for (const lock of locks.reverse()) lock.release();
+        if (registered) await unregister(registered); else for (const lock of locks.reverse()) lock.release();
         return;
       }
-      if (runtime) cleanup(); else if (registered) unregister(registered); else for (const lock of locks.reverse()) lock.release();
+      if (runtime) await cleanup(ctx); else if (registered) await unregister(registered); else for (const lock of locks.reverse()) lock.release();
       failure = `Projects disabled: ${describeError(error)}`;
       if (isWriterConflict(error)) {
         ctx.ui.notify("Another live or uncertain writer owns this project session. This Pi will close without changing the conversation; use its existing terminal.", "error");
@@ -236,14 +233,7 @@ export function createSessionRuntime(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", () => cleanup());
-  const denySwitch = (_event: unknown, ctx: ExtensionContext) => {
-    const decision = sessionSwitchDecision(!!runtime);
-    if (decision) ctx.ui.notify("This conversation is registered with Projects. Use a new terminal for another session; /reload is supported.", "warning");
-    return decision;
-  };
-  pi.on("session_before_switch", denySwitch);
-  pi.on("session_before_fork", denySwitch);
+  pi.on("session_shutdown", async (_event, ctx) => { await cleanup(ctx); });
 
   // Only a turn that began with an open thread may undo a different session's agent resolution.
   const reopenForHuman = async (r: Runtime, settled = false) => {

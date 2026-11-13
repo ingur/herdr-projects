@@ -9,6 +9,7 @@ import { Store } from "../core/store.mjs";
 import { acquireLock, atomicJSON } from "../core/lib/state.mjs";
 import { closeSession, createThread, deleteSession, ensureSession, listSessions, orderSession, placeSession, publishControlDescriptor, publishMessage, renameSession, reopenSession, resolveSession, sendMessage, showSession } from "../core/control.mjs";
 import { shouldReopen } from "../core/messages.mjs";
+import { registerCurrentSession, unregisterCurrentSession } from "../pi/registration.mjs";
 
 function fixture(t) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "project-control-")));
@@ -330,6 +331,26 @@ test("stopped threads reopen in their project's observed live space, not stale r
   assert.equal(opened.space, "current-space");
   assert.equal(io.rows[1].labels["herdr.space"], "current-space");
   assert.equal(f.store.record(parent.id).space, "space-one");
+});
+
+test("stopped threads follow their project's newly registered placement, including no Herdr space", async t => {
+  for (const space of ["new-space", undefined]) {
+    const f = fixture(t), io = transport(f), parent = coordinator(f);
+    retained(f);
+    const sessionDir = join(f.root, "pi-sessions"), sessionFile = join(sessionDir, "project.jsonl");
+    registerCurrentSession(f.store, { id: parent.id, agent: "pi", cwd: f.projectRoot, owner: processIdentity(),
+      terminal: "t2", space, tab: space ? "new-tab" : undefined, sessionDir, sessionFile });
+    unregisterCurrentSession(f.store, { id: parent.id, sessionFile });
+    assert.equal(f.store.record(f.record.id).space, "space-one", "moving a project does not rewrite its threads");
+    io.onRun = row => register(f, row);
+    const opened = await ensureSession(f.options, io);
+    assert.equal(opened.space, space);
+    assert.equal(io.rows[0].labels["herdr.space"], space);
+    if (space === undefined) {
+      assert.equal(opened.tab, undefined);
+      assert.ok(!runs(io)[0].args.some(value => value.startsWith("herdr.")));
+    }
+  }
 });
 
 test("close kills only the owned coordinator terminal, leaving threads and transcript intact", async t => {
