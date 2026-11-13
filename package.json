@@ -1,7 +1,7 @@
 {
   "name": "@ingur/herdr-projects",
   "version": "0.1.0",
-  "description": "Persistent project conversations and threads for Pi and hc",
+  "description": "A Pi extension for long-running projects in herdr terminals",
   "type": "module",
   "license": "MIT",
   "keywords": ["pi-package"],
