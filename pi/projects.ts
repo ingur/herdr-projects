@@ -4,7 +4,7 @@ import { describeError, renameSchema, sendSchema, startSchema, targetSchema } fr
 import { toolDescriptions } from "./prompts.mjs";
 import { createSessionRuntime } from "./session.ts";
 import { renameThread, reopenThread, resolveThread, sendThread, startThread } from "./threads.ts";
-import { listThreads } from "./pi-catalog.mjs";
+import { listThreads, statusText } from "./pi-catalog.mjs";
 import { dormantHint } from "./registration.mjs";
 import { resumeProject } from "./resume.ts";
 import { waitingDelivery } from "../core/messages.mjs";
@@ -90,8 +90,7 @@ export default function projects(pi: ExtensionAPI) {
         const deliveries = session.reconcileDelivery(r);
         const waitingMessages = deliveries.filter(item => waitingDelivery(item.delivery)).length;
         const possiblyUndelivered = deliveries.filter(item => item.delivery.state === "uncertain" && item.delivery.redelivered).length;
-        const value = { ...await listThreads(r), waitingMessages, ...(possiblyUndelivered ? { possiblyUndelivered } : {}) };
-        ctx.ui.notify(JSON.stringify(value, null, 2), "info");
+        ctx.ui.notify(statusText(await listThreads(r), waitingMessages, possiblyUndelivered), "info");
       } catch (error) {
         ctx.ui.notify(`Projects: ${describeError(error)}`, !verb && session.independent() ? "info" : "error");
       }
