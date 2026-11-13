@@ -127,10 +127,15 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
 - **Register again when the conversation is replaced** in the same terminal (a new or forked
   conversation keeps the project), with the new adapter data.
 - **Release on exit:** `release {id}`. A crash skips it; the pid check covers that.
-- **Tell the agent what a message is.** Its instructions say that a `<message>` tag names who
-  sent it through the project and that only `from="user"` is the user.
-- **Give the agent the actions it may use:** `create-thread`, `list`, `send`, `rename` and
-  `resolve` with `by: "agent"` and its own id as `from`/`coordinator`. Never `delete`.
+- **Tell the agent its role and what a message is.** A coordinator starts threads and carries
+  on while they work; a thread sends its result to the coordinator when it is done (wording in
+  `pi/prompts.mjs`). A `<message>` tag names who sent it through the project, and only
+  `from="user"` is the user.
+- **Give the agent the actions its role may use,** with `by: "agent"` and its own id as
+  `from`/`coordinator`: a coordinator gets `create-thread`, `list`, `send`, `rename` and
+  `resolve`; a thread gets `list`, `send` and `rename` (itself only). Show `list` for its own
+  project only. Never `delete`. Core refuses a thread's `resolve` but not the rest, so the
+  integration enforces this.
 - **Pass the user's own changes on:** a title the user sets is `rename` with `by: "user"`; input
   the user submits in a resolved session is `reopen`. A title changed elsewhere shows in the
   session's record file.
