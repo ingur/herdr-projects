@@ -2,6 +2,7 @@
 
 hc runs terminals and types text in. `core/` keeps the records and decides who may send what to
 whom, with no agent-specific code. An adapter starts, resumes and deletes one tool's conversations.
+An integration inside each session binds it and gives the agent its tools.
 
 ## Records
 
@@ -57,8 +58,8 @@ message was typed; when the recipient was `idle` or `done` and no turn started, 
 
 ## Actions
 
-`node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control`) prints one JSON object; errors print `projects: message` on stderr and exit 1. The same
-functions are `actions[name](options, io)` in `core/control.mjs`, next to `stateDirectory()`,
+`node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control`) prints one JSON object;
+errors print `projects: message` on stderr and exit 1. The same functions are `actions[name](options, io)` in `core/control.mjs`, next to `stateDirectory()`,
 `readRecord(stateDir, id)` and `findRecord(stateDir, predicate)`. `by` is `"user"` or `"agent"`.
 
 | Action | Options | Does |
@@ -108,6 +109,31 @@ Pi keeps `{sessionId, sessionFile, command, env}`, `env` limited to `ENV` in `pi
 `resume` uses `--session FILE` once it exists, else `--session-id ID`; `start` adds `--name TITLE`;
 `inherit` copies only `command` and `env`. `remove` deletes the transcript only when it is a
 regular file inside a Pi sessions directory whose header names `sessionId`.
+
+## Inside a session
+
+The adapter is the launch side. What runs inside each session (a plugin, hooks, or the agent
+calling `control` from its shell) must do the following; `pi/projects.ts` is the example.
+
+- **Report status to hc.** The agent tells its terminal `idle`, `working`, `done`, `blocked` or
+  `error` (OSC 7501, hc's Program Status Protocol). hc never guesses it from the screen, and a
+  session without a status stays `starting`, so its mail waits forever.
+- **Run in an hc terminal.** `$HC_TERMINAL_ID` is the `terminal` for `register`.
+- **Register at start.** A session launched by core finds its record id in `$PROJECTS_SESSION`.
+  Call `register {id, cwd, agent, adapter, terminal, pid}` with the agent's own pid and the
+  adapter data that lets `resume` find this conversation again. Without `id` it creates a
+  project from the current conversation. Do not block start-up on it: it returns once waiting
+  mail is typed, which needs the agent running.
+- **Register again when the conversation is replaced** in the same terminal (a new or forked
+  conversation keeps the project), with the new adapter data.
+- **Release on exit:** `release {id}`. A crash skips it; the pid check covers that.
+- **Tell the agent what a message is.** Its instructions say that a `<message>` tag names who
+  sent it through the project and that only `from="user"` is the user.
+- **Give the agent the actions it may use:** `create-thread`, `list`, `send`, `rename` and
+  `resolve` with `by: "agent"` and its own id as `from`/`coordinator`. Never `delete`.
+- **Pass the user's own changes on:** a title the user sets is `rename` with `by: "user"`; input
+  the user submits in a resolved session is `reopen`. A title changed elsewhere shows in the
+  session's record file.
 
 ## Known limits
 

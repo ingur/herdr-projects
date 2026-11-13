@@ -12,7 +12,7 @@ pi install git:github.com/ingur/herdr-projects
 
 Needs `hc` (herdr-core) 0.1.20 or newer. Linux and macOS.
 
-## Use
+## Use (Pi)
 
 Start `pi` in a herdr terminal, then:
 
@@ -38,7 +38,7 @@ The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `threa
 - Only you can delete.
 - State lives in `~/.local/state/herdr-projects`. Nothing is written into your repo.
 
-## Update, remove
+## Update, remove (Pi)
 
 ```sh
 pi update --extensions
