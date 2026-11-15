@@ -137,6 +137,28 @@ test("close kills only a terminal that still carries the session's label", async
   assert.equal(bystander.state, "live");
 });
 
+test("closing a project kills each of its sessions once and nothing else", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), other = f.save({ title: "Other" });
+  const workers = ["One", "Two", "Three"].map(title => f.save({ role: "thread", coordinator: coordinator.id, title }));
+  const stopped = f.save({ role: "thread", coordinator: coordinator.id, title: "Stopped" });
+  const project = [coordinator, ...workers].map(record => io.terminal(f.bound(record.id)));
+  const kept = [io.terminal({}), io.terminal(f.bound(stopped.id, DEAD)), io.terminal(f.bound(other.id))];
+  await actions.close({ ...f.options, id: coordinator.id }, io);
+  assert.deepEqual(verbs(io, "kill").map(args => args[1]).sort(), project.map(row => row.address).sort());
+  assert.deepEqual(kept.map(row => row.state), ["live", "live", "live"]);
+  assert.deepEqual([...workers, stopped].map(thread => readRecord(f.stateDir, thread.id).reopenWithProject), [true, true, true, undefined]);
+});
+
+test("a thread launches with its coordinator's current command", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
+  // The thread's own register stored the command it ran under, which has since moved.
+  const sessionId = randomUUID(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker", reopenWithProject: true,
+    adapter: { sessionId, command: ["/old/node", "/old/pi"], env: { PATH: "/old" } } });
+  const moved = { ...coordinator.adapter, command: ["/new/node", "/new/pi"], env: { PATH: "/new" } };
+  await actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: moved, terminal: io.terminal({}).address, pid: process.pid }, io);
+  assert.deepEqual(io.rows.at(-1).argv, ["env", "PATH=/new", `PROJECTS_SESSION=${thread.id}`, "/new/node", "/new/pi", "--session-id", sessionId]);
+});
+
 test("a terminal counts only while the agent process it names is alive", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save();
   const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });

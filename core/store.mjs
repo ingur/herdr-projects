@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const LOCK_WAIT = 120_000;
+// A waiter writes its lock file before it waits, so LOCK_STALE covers LOCK_WAIT plus far more than any real hold.
+const LOCK_WAIT = 120_000, LOCK_STALE = 10 * 60_000;
 
 export function stateDirectory(value = process.env.PROJECTS_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "herdr-projects")) {
   if (typeof value !== "string" || !isAbsolute(value)) throw new Error("stateDir must be an absolute path");
@@ -71,9 +72,9 @@ export function alive(pid) {
   catch (error) { return error.code === "EPERM"; }
 }
 
-// The lock file holds its owner's pid; a lock whose owner died is taken over.
+// The lock file holds its owner's pid; a lock whose owner died, or that is stale (after a reboot the pid may be another process), is taken over.
 function abandoned(path) {
-  try { return !alive(Number(readFileSync(path, "utf8"))); }
+  try { return Date.now() - statSync(path).mtimeMs > LOCK_STALE || !alive(Number(readFileSync(path, "utf8"))); }
   catch { return false; }
 }
 

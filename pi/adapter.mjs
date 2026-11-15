@@ -13,24 +13,20 @@ function command(record) {
   return command;
 }
 
-export function start(record) {
-  return [...command(record), "--name", record.title];
+export function start(record, coordinator) {
+  return [...command(coordinator), "--name", record.title];
 }
 
 // --session-id only finds sessions of the current folder, so the file wins once it exists.
-export function resume(record) {
+export function resume(record, coordinator) {
   const { sessionFile, sessionId } = record.adapter;
-  if (typeof sessionFile === "string" && existsSync(sessionFile)) return [...command(record), "--session", sessionFile];
-  if (typeof sessionId === "string") return [...command(record), "--session-id", sessionId];
+  if (typeof sessionFile === "string" && existsSync(sessionFile)) return [...command(coordinator), "--session", sessionFile];
+  if (typeof sessionId === "string") return [...command(coordinator), "--session-id", sessionId];
 }
 
 export function env(record) {
   const values = record.adapter.env ?? {};
   return Object.fromEntries(ENV.filter(key => typeof values[key] === "string").map(key => [key, values[key]]));
-}
-
-export function inherit(record) {
-  return { command: record.adapter.command, env: env(record) };
 }
 
 function inside(root, path) {

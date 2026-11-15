@@ -19,6 +19,8 @@ const UNLABEL = ["projects.session=", "projects.pid=", "projects.control=", "pro
 const errorText = error => error instanceof Error ? error.message : String(error);
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const descriptor = stateDir => JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir });
+// A project's terminals in one read, as list does; a lone thread reads only its own.
+const snapshot = (io, stateDir, record) => details(io, record.role === "coordinator" ? `projects.control=${descriptor(stateDir)}` : `projects.session=${record.id}`);
 
 function session(stateDir, id) {
   const record = readRecord(stateDir, id);
@@ -139,15 +141,17 @@ async function launch(stateDir, id, io, place) {
       let target = place ?? record.space;
       if (place === undefined && record.role === "thread") target = (await observe(io, record.coordinator)).terminal?.labels["herdr.space"] ?? target;
       const tab = target === undefined ? undefined : record.tab ?? `pt-${id}`;
-      const module = await adapter(record.agent);
-      const argv = module.resume(record) ?? module.start(record);
-      const env = Object.entries(module.env(record)).map(([key, value]) => `${key}=${value}`);
+      // A thread starts the way its coordinator last registered, so it follows a Node or Pi upgrade.
+      const module = await adapter(record.agent), coordinator = session(stateDir, record.coordinator);
+      const argv = module.resume(record, coordinator) ?? module.start(record, coordinator);
+      const env = Object.entries(module.env(coordinator)).map(([key, value]) => `${key}=${value}`);
       const { address } = await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd, "--name", terminalName(record),
         ...(target === undefined ? [] : ["--label", `herdr.space=${target}`, "--label", `herdr.tab=${tab}`]),
         "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`,
         "--", "env", ...env, `PROJECTS_SESSION=${id}`, ...argv]);
       // With `env … agent`, env execs the agent, so the program pid hc reports is the agent's.
       const { pid } = await hc(io, ["get", address, "--json"]);
+      if (!pid) throw new Error("Needs hc 0.1.20 or newer");
       await hc(io, ["label", address, "--json", `projects.pid=${pid}`]);
       rewrite(stateDir, id, () => ({ space: target, tab }));
       return {};
@@ -156,8 +160,8 @@ async function launch(stateDir, id, io, place) {
 }
 
 // hc has no conditional kill: the label is read again right before it.
-async function stop(stateDir, id, io) {
-  const { terminal } = await observe(io, id);
+async function stop(stateDir, id, io, rows) {
+  const { terminal } = classify(rows, id);
   if (!terminal) return;
   const current = await hc(io, ["get", terminal.address, "--json"]);
   if (!holds(current, id)) return;
@@ -166,17 +170,17 @@ async function stop(stateDir, id, io) {
   if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
 }
 
-async function closeThreads(stateDir, coordinator, io) {
-  for (const thread of threads(stateDir, coordinator)) {
-    if (!(await observe(io, thread.id)).terminal) continue;
+async function closeThreads(stateDir, coordinator, io, rows) {
+  await Promise.all(threads(stateDir, coordinator).filter(thread => classify(rows, thread.id).terminal).map(async thread => {
     await update(stateDir, thread.id, () => ({ reopenWithProject: true }), io);
-    await stop(stateDir, thread.id, io);
-  }
+    await stop(stateDir, thread.id, io, rows);
+  }));
 }
 
 async function close(stateDir, record, io) {
-  if (record.role === "coordinator") await closeThreads(stateDir, record.id, io);
-  await stop(stateDir, record.id, io);
+  const rows = await snapshot(io, stateDir, record);
+  if (record.role === "coordinator") await closeThreads(stateDir, record.id, io, rows);
+  await stop(stateDir, record.id, io, rows);
 }
 
 function writeShim(stateDir) {
@@ -233,24 +237,24 @@ export const actions = {
     }
     writeShim(stateDir);
     const errors = [];
-    for (const thread of threads(stateDir, id).filter(thread => thread.reopenWithProject)) {
+    await Promise.all(threads(stateDir, id).filter(thread => thread.reopenWithProject).map(async thread => {
       await update(stateDir, thread.id, () => ({ reopenWithProject: undefined }), io);
-      if (thread.resolved) continue;
+      if (thread.resolved) return;
       const { error } = await launch(stateDir, thread.id, io);
       if (error) errors.push(`${thread.title}: ${error}`);
-    }
+    }));
     const { error } = await deliver(stateDir, id, io, 60);
     if (error) errors.push(error);
     return changed(stateDir, id, io, errors.length ? { error: errors.join("; ") } : {});
   },
 
   async release(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
-    for (const row of (await observe(io, record.id)).labelled) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), rows = await snapshot(io, stateDir, record);
+    for (const row of classify(rows, record.id).labelled) {
       await remember(stateDir, record.id, row, io);
       await hc(io, ["label", row.address, "--json", ...UNLABEL]);
     }
-    if (record.role === "coordinator") await closeThreads(stateDir, record.id, io);
+    if (record.role === "coordinator") await closeThreads(stateDir, record.id, io, rows);
     return changed(stateDir, record.id, io);
   },
 
@@ -262,7 +266,6 @@ export const actions = {
     if (options.cwd !== undefined && typeof options.cwd !== "string") throw new Error("cwd must be a path");
     const cwd = resolve(coordinator.cwd, options.cwd ?? ".");
     if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} is not a directory`);
-    const inherited = (await adapter(coordinator.agent)).inherit(coordinator);
     const { existing, record } = await locked(stateDir, coordinator.id, () => {
       const siblings = threads(stateDir, coordinator.id), taken = new Set(siblings.map(thread => thread.title.toLowerCase()));
       const existing = wanted === undefined ? undefined : siblings.find(thread => thread.title.toLowerCase() === wanted.toLowerCase());
@@ -275,7 +278,7 @@ export const actions = {
         titleSource: wanted === undefined ? "placeholder" : by, cwd, agent: coordinator.agent, resolved: false,
         rank: created.getTime(), created: created.toISOString(),
         waiting: text === undefined ? [] : [{ from: "coordinator", title: coordinator.title, id: coordinator.id, text, created: created.toISOString() }],
-        adapter: inherited }) };
+        adapter: {} }) };
     }, io);
     if (existing) return changed(stateDir, existing.id, io, { existing: true });
     const launched = await launch(stateDir, record.id, io);
@@ -371,14 +374,14 @@ export const actions = {
   },
 
   async delete(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
-    const deleted = [];
-    for (const target of record.role === "coordinator" ? [...threads(stateDir, record.id), record] : [record]) {
-      await stop(stateDir, target.id, io);
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), rows = await snapshot(io, stateDir, record);
+    const remove = async target => {
+      await stop(stateDir, target.id, io, rows);
       (await adapter(target.agent)).remove(session(stateDir, target.id));
       removeRecord(stateDir, target.id);
-      deleted.push(target.id);
-    }
+      return target.id;
+    };
+    const deleted = [...await Promise.all(threads(stateDir, record.id).map(remove)), await remove(record)];
     if (record.role === "thread") await touch(io, record.coordinator);
     return { deleted };
   },

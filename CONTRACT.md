@@ -24,7 +24,8 @@ adapter: {}                            owned by the adapter
 ```
 
 Writes go to a dot-file in the same directory, then rename. Updates are read-modify-write under
-the session's lock file, which holds the owner's pid; a lock whose owner died is taken over.
+the session's lock file, which holds the owner's pid; a lock whose owner died, or older than 10
+minutes, is taken over.
 
 ## Running
 
@@ -90,8 +91,9 @@ status (hc's word, only when running), waiting (count), error?
 `hc run --bg --json --no-parent --cwd CWD --name SLUG-ID8 [--label herdr.space=S --label
 herdr.tab=T] --label projects.session=ID --label projects.control=… -- env K=V …
 PROJECTS_SESSION=ID <adapter argv>`, then `projects.pid` from the pid hc reports (`env` execs the
-agent). A thread starts in its coordinator's space while that runs, else in its recorded space,
-else unplaced. A failed `hc run` gives an `error`; mail stays.
+agent); an hc that reports no pid (before 0.1.20) fails the launch. A thread starts in its
+coordinator's space while that runs, else in its recorded space, else unplaced. A failed `hc run`
+gives an `error`; mail stays.
 
 - `projects.session=<id>`: the terminal running that session.
 - `projects.pid=<pid>`: the agent process; the terminal counts only while it is alive.
@@ -100,15 +102,18 @@ else unplaced. A failed `hc run` gives an `error`; mail stays.
 
 ## Adapters
 
-`core/adapters.mjs` maps an agent kind to a module exporting `start(record)` (argv for a new
-conversation), `resume(record)` (argv to continue it, or nothing when there is none yet),
-`env(record)` (a short allow-list from `record.adapter`), `inherit(record)` (adapter data a new
-thread of this coordinator starts with) and `remove(record)` (delete the conversation).
+`core/adapters.mjs` maps an agent kind to a module exporting `start(record, coordinator)` (argv for
+a new conversation), `resume(record, coordinator)` (argv to continue it, or nothing when there is
+none yet), `env(record)` (a short allow-list from `record.adapter`) and `remove(record)` (delete
+the conversation). At launch `coordinator` is the coordinator's record as it is now (a
+coordinator's own) and `env` is called with it, so a thread starts the way its coordinator last
+registered. A new thread's `adapter` is `{}`.
 
 Pi keeps `{sessionId, sessionFile, command, env}`, `env` limited to `ENV` in `pi/adapter.mjs`.
 `resume` uses `--session FILE` once it exists, else `--session-id ID`; `start` adds `--name TITLE`;
-`inherit` copies only `command` and `env`. `remove` deletes the transcript only when it is a
-regular file inside a Pi sessions directory whose header names `sessionId`.
+both run the coordinator's `command`, so a thread's own `command` and `env` are not used to launch
+it. `remove` deletes the transcript only when it is a regular file inside a Pi sessions directory
+whose header names `sessionId`.
 
 ## Inside a session
 
