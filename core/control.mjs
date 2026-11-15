@@ -184,7 +184,8 @@ async function close(stateDir, record, io) {
 }
 
 function writeShim(stateDir) {
-  writeExecutable(join(stateDir, "bin", "control"), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fileURLToPath(import.meta.url))} "$@"\n`);
+  // The recorded node can go with an upgrade; the one on PATH then runs it.
+  writeExecutable(join(stateDir, "bin", "control"), `#!/bin/sh\nnode=${quote(process.execPath)}\n[ -x "$node" ] || node=node\nexec "$node" ${quote(fileURLToPath(import.meta.url))} "$@"\n`);
 }
 
 export const actions = {
