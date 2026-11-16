@@ -3,6 +3,9 @@
 hc runs terminals and types text in. `core/` keeps the records and enforces the rules below, with
 no agent-specific code. An adapter starts, resumes and deletes one tool's conversations. An
 integration inside each session binds it, gives the agent its tools and keeps it inside its project.
+Sessions and the user send each other messages. A client (the sidebar, `control`, a front end) is
+how the user acts, and core treats every client as the user. What the user types in a session's
+terminal reaches its agent directly and is never a message.
 
 ## Records
 
@@ -58,6 +61,12 @@ Delivery types waiting mail in order and removes each message once hc took it. A
 and at `register` it waits up to 60 s for the session to run. `sent` is true only when this
 message was typed; when the recipient was `idle` or `done` and no turn started, the note says so.
 
+`to` may be `"user"`, with a session as `from`. Nothing is typed: the message is stored as
+`<stateDir>/user/<key>.json`, `{from, title, id, text, created}`, keys sorting by time, and `send`
+returns the sender's view with `sent: false` and a note. A client takes it with `collect`. To start
+a thread with an instruction, a client calls `create-thread` without `text`, then `send`: `text` is
+from the coordinator, so the thread would report to a coordinator that never asked.
+
 ## Actions
 
 `node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control`) prints one JSON object;
@@ -69,9 +78,10 @@ errors print `projects: message` on stderr and exit 1. The same functions are `a
 | `list` | `{}` | `{sessions: [view], errors?}`: coordinators by rank, highest first, each followed by its threads, unresolved first, by rank |
 | `register` | `{id?, title?, cwd, agent, adapter, terminal, pid}` | Binds the conversation in an hc terminal; `pid` is the agent's own process. Without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another terminal holds the session. Labels the terminal, saves `adapter`, `cwd` and placement, clears what the session left elsewhere, launches its unresolved threads that were open, delivers waiting mail |
 | `release` | `{id}` | The session leaves its terminal: a terminal core started keeps the session's labels and loses `projects.pid`, a terminal the user started loses every `projects.*` label; a coordinator's open threads are closed and flagged `reopenWithProject` |
-| `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case, also on rename), at most 80 characters, not `coordinator`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
+| `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case, also on rename), at most 80 characters, not `coordinator` or `user`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
 | `open` | `{id, space?}` | Launches when stopped; returns once the terminal exists |
 | `send` | `{to, from?, text}` | As above; adds `sent` and `note?` |
+| `collect` | `{taken?: [key]}` | Removes the user's mail named in `taken`, then returns `{messages: [{key, from, title, id, text, created}]}`, oldest first. A client names what it handed over in its next call, so after a crash it gets it again. Refuses a key not of the form it returns |
 | `rename` | `{id, title, by}` | An agent cannot change a `user` title |
 | `order` | `{id, rank}` | |
 | `place` | `{id, space}` | Only when stopped |
@@ -148,12 +158,14 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
 - **Tell the agent its role and what a message is.** A coordinator starts threads and carries
   on while they work; a thread sends its result to the coordinator when it is done (wording in
   `pi/prompts.mjs`). A `<message>` tag names who sent it through the project, and only
-  `from="user"` is the user.
+  `from="user"` is the user. What the user types is answered on the screen; a message from the
+  user is answered, once complete, by `send` to `"user"`, and so is a question back. A session
+  that never received a message from the user never writes to the user.
 - **Give the agent the actions its role may use,** with `by: "agent"` and its own id as
   `from`/`coordinator`: a coordinator gets `create-thread`, `list`, `send`, `rename` and
   `resolve`; a thread gets `list`, `send` and `rename` (itself only). Show `list` for its own
-  project only. Never `delete`. Core refuses a thread's `resolve` but not the rest, so the
-  integration enforces this.
+  project only; `send` goes to its sessions or `"user"`. Never `delete`. Core refuses a thread's
+  `resolve` but not the rest, so the integration enforces this.
 - **Pass the user's own changes on:** a title the user sets is `rename` with `by: "user"`; input
   the user submits in a resolved session is `unresolve`. A title changed elsewhere shows in the
   session's record file.
@@ -170,6 +182,11 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
 - A tool that asks a startup question reports no status until it is answered; mail waits.
 - Delivery is at least once: if `hc send` fails after hc typed a message, it stays waiting and is
   typed again.
+- An agent that prints its answer instead of sending it leaves a message from the user unanswered;
+  core cannot tell.
+- A client's text carries the user's authority, also when it rephrased him.
+- Mail to the user is written by agents. A client that is itself a model hands it to the user and
+  sends only what the user said, or an agent's text becomes the user's instruction to any session.
 - A reboot (or an hc restart) brings a session's tab back as a shell: the session shows `stopped`
   until it is opened again, which starts it in that tab and closes the empty shell.
 - Requires hc 0.1.20 or newer.

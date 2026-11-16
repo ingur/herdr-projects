@@ -352,3 +352,64 @@ test("an agent cannot rename a title the user chose", async t => {
   assert.equal(renamed.title, "Parser");
   assert.equal(renamed.titleSource, "agent");
 });
+
+test("mail to the user waits in order until a client names it as taken", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const row = io.terminal(f.bound(coordinator.id));
+  assert.deepEqual(await actions.collect(f.options), { messages: [] });
+  const stored = await actions.send({ ...f.options, to: "user", from: coordinator.id, text: "first" }, io);
+  assert.deepEqual([stored.id, stored.sent, stored.note], [coordinator.id, false, "stored for the user"]);
+  assert.ok(row.labels["projects.changed"]);
+  await actions.send({ ...f.options, to: "user", from: thread.id, text: "second" }, io);
+  assert.deepEqual(row.typed, []);
+  const { messages } = await actions.collect(f.options);
+  assert.deepEqual(messages.map(({ from, title, id, text }) => [from, title, id, text]),
+    [["coordinator", "Project", coordinator.id, "first"], ["thread", "Worker", thread.id, "second"]]);
+  // A client that died before handing the mail over gets the same mail again.
+  assert.deepEqual(await actions.collect(f.options), { messages });
+  assert.deepEqual((await actions.collect({ ...f.options, taken: [messages[0].key] })).messages, [messages[1]]);
+  assert.deepEqual((await actions.collect({ ...f.options, taken: [messages[0].key, messages[1].key] })).messages, []);
+  await assert.rejects(actions.collect({ ...f.options, taken: ["../sessions/" + coordinator.id] }), /keys from collect/);
+  assert.ok(readRecord(f.stateDir, coordinator.id));
+});
+
+test("only a session writes to the user, and no thread is called user", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save();
+  await assert.rejects(actions.send({ ...f.options, to: "user", text: "hello" }, io), /comes from a session/);
+  await assert.rejects(actions.send({ ...f.options, to: "user", from: randomUUID(), text: "hello" }, io), /No session/);
+  await assert.rejects(actions["create-thread"]({ ...f.options, coordinator: coordinator.id, title: "User", by: "agent" }, io), /cannot be called user/);
+  const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  await assert.rejects(actions.rename({ ...f.options, id: thread.id, title: "user", by: "user" }, io), /cannot be called user/);
+  assert.deepEqual(await actions.collect(f.options), { messages: [] });
+});
+
+test("mail to the user changes nothing for a session's own mail or the list", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  io.terminal(f.bound(coordinator.id));
+  await actions.send({ ...f.options, to: "user", from: thread.id, text: "done" }, io);
+  const { sessions, errors } = await actions.list(f.options, io);
+  assert.equal(errors, undefined);
+  assert.deepEqual(sessions.map(view => [view.id, view.waiting]), [[coordinator.id, 0], [thread.id, 0]]);
+});
+
+test("a question to a stopped project comes back through the user's mail", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
+  // The client asks while the project is stopped, then opens it.
+  const asked = await actions.send({ ...f.options, to: coordinator.id, text: "How far is the port?" }, io);
+  assert.deepEqual([asked.sent, asked.state, asked.waiting], [false, "stopped", 1]);
+  await actions.open({ ...f.options, id: coordinator.id }, io);
+  const home = io.rows.at(-1);
+  home.status = { app: "pi", state: "idle" };
+  await actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: coordinator.adapter, terminal: home.address, pid: process.pid }, io);
+  assert.deepEqual(home.typed, [wrap({ from: "user", text: "How far is the port?" })]);
+  // The coordinator fans out, and the thread reports in a turn of its own.
+  io.onRun = row => { row.status = { app: "pi", state: "idle" }; };
+  const thread = await actions["create-thread"]({ ...f.options, coordinator: coordinator.id, title: "Count", by: "agent", text: "Count the ported files." }, io);
+  await actions.send({ ...f.options, to: coordinator.id, from: thread.id, text: "12 of 30" }, io);
+  assert.equal(home.typed.length, 2);
+  // Its answer goes to the user and waits until the client has handed it over.
+  await actions.send({ ...f.options, to: "user", from: coordinator.id, text: "12 of 30 files are ported." }, io);
+  const { messages: [answer] } = await actions.collect(f.options);
+  assert.deepEqual([answer.from, answer.title, answer.id, answer.text], ["coordinator", "Project", coordinator.id, "12 of 30 files are ported."]);
+  assert.deepEqual(await actions.collect({ ...f.options, taken: [answer.key] }), { messages: [] });
+});

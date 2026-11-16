@@ -1,6 +1,6 @@
 {
   "name": "@ingur/herdr-projects",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Long-running projects for coding agents in herdr terminals",
   "type": "module",
   "license": "MIT",

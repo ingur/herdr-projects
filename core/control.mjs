@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { adapter } from "./adapters.mjs";
 import { classify, details, hc, holds, observe } from "./hc.mjs";
-import { findRecord, locked, readRecord, readRecords, removeRecord, rewrite, stateDirectory, update, writeExecutable, writeRecord } from "./store.mjs";
+import { collectMail, findRecord, locked, readRecord, readRecords, removeRecord, rewrite, stateDirectory, update, writeExecutable, writeMail, writeRecord } from "./store.mjs";
 
 export { findRecord, readRecord, stateDirectory };
 
@@ -14,6 +14,7 @@ const STORED = {
   starting: "stored; it goes out when the session starts",
   blocked: "stored; the session is waiting on the user",
   coordinator: "stored; it goes out when the user resumes the project",
+  user: "stored for the user",
 };
 const UNLABEL = ["projects.session=", "projects.pid=", "projects.control=", "projects.changed=", "projects.launched="];
 const errorText = error => error instanceof Error ? error.message : String(error);
@@ -33,7 +34,7 @@ function threads(stateDir, coordinator) {
 function title(value, role) {
   const trimmed = typeof value === "string" ? value.trim() : "";
   if (!trimmed || trimmed.length > 80 || /[\x00-\x1f\x7f]/.test(trimmed)) throw new Error("A title is 1 to 80 printable characters");
-  if (role === "thread" && trimmed.toLowerCase() === "coordinator") throw new Error("A thread cannot be called coordinator");
+  if (role === "thread" && ["coordinator", "user"].includes(trimmed.toLowerCase())) throw new Error(`A thread cannot be called ${trimmed.toLowerCase()}`);
   return trimmed;
 }
 function author(value) {
@@ -320,7 +321,14 @@ export const actions = {
   },
 
   async send(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), recipient = session(stateDir, options.to);
+    const stateDir = stateDirectory(options.stateDir);
+    if (options.to === "user") {
+      if (options.from === undefined) throw new Error("A message to the user comes from a session");
+      const sender = session(stateDir, options.from);
+      writeMail(stateDir, { from: sender.role, title: sender.title, id: sender.id, text: messageText(options.text), created: new Date().toISOString() });
+      return changed(stateDir, sender.id, io, { sent: false, note: STORED.user });
+    }
+    const recipient = session(stateDir, options.to);
     const sender = options.from === undefined ? undefined : session(stateDir, options.from), text = messageText(options.text);
     if (recipient.role === "thread" && recipient.resolved) {
       if (sender && sender.id !== recipient.coordinator) throw new Error("This thread is resolved; only its coordinator or the user can reopen it");
@@ -339,6 +347,10 @@ export const actions = {
     const note = sent ? result.note : result.held === "blocked" ? STORED.blocked
       : recipient.role === "coordinator" && result.held === "stopped" ? STORED.coordinator : STORED.starting;
     return changed(stateDir, recipient.id, io, { sent, ...(note ? { note } : {}), ...(result.error ? { error: result.error } : {}) });
+  },
+
+  async collect(options = {}) {
+    return { messages: collectMail(stateDirectory(options.stateDir), options.taken) };
   },
 
   async rename(options, io = {}) {

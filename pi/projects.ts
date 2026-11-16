@@ -192,6 +192,11 @@ export default function projects(pi: ExtensionAPI) {
     target: Type.String({ minLength: 1, maxLength: 200, description: tools.thread_send.target }),
     text: Type.String({ minLength: 1, maxLength: 100000, description: tools.thread_send.text }),
   }, { additionalProperties: false }), async (b, args) => {
+    if (args.target === "user") {
+      await actions.send({ to: "user", from: b.id, text: args.text });
+      // Core answers sent: false because nothing is typed; to the agent that reads as a failure.
+      return { sent: true, to: "user" };
+    }
     const { me, sessions } = await project(b.id);
     const target = find(args.target, me, sessions);
     if (target.id === me.id) throw new Error("Send to another session, not yourself.");

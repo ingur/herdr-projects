@@ -66,6 +66,29 @@ export function removeRecord(stateDir, id) {
   rmSync(recordPath(stateDir, id), { force: true });
 }
 
+// The user's mail: one file per message. Its name is the key and sorts by time, so no lock is needed.
+const KEY = /^\d{13}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+let last = 0;
+
+export function writeMail(stateDir, message) {
+  // Strictly increasing, so one sender's messages keep their order within a millisecond.
+  last = Math.max(Date.now(), last + 1);
+  atomicWrite(join(stateDir, "user", `${last}-${randomUUID()}.json`), JSON.stringify(message, null, 2) + "\n", 0o600);
+}
+
+// Removes the mail named in `taken`, then returns what waits, oldest first.
+export function collectMail(stateDir, taken = []) {
+  if (!Array.isArray(taken) || taken.some(key => typeof key !== "string" || !KEY.test(key))) throw new Error("taken must be a list of keys from collect");
+  for (const key of taken) rmSync(join(stateDir, "user", `${key}.json`), { force: true });
+  let names;
+  try { names = readdirSync(join(stateDir, "user")); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  return names.filter(name => name.endsWith(".json") && KEY.test(name.slice(0, -".json".length))).sort().flatMap(name => {
+    try { return [{ key: name.slice(0, -".json".length), ...JSON.parse(readFileSync(join(stateDir, "user", name), "utf8")) }]; }
+    catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  });
+}
+
 export function alive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; }
