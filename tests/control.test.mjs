@@ -413,3 +413,15 @@ test("a question to a stopped project comes back through the user's mail", async
   assert.deepEqual([answer.from, answer.title, answer.id, answer.text], ["coordinator", "Project", coordinator.id, "12 of 30 files are ported."]);
   assert.deepEqual(await actions.collect({ ...f.options, taken: [answer.key] }), { messages: [] });
 });
+
+test("mail that cannot be read is reported and does not hide the rest", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save();
+  await actions.send({ ...f.options, to: "user", from: coordinator.id, text: "before" }, io);
+  // What a crash can leave: the file is there, its content never reached the disk.
+  const broken = `${Date.now() + 1000}-${randomUUID()}`;
+  writeFileSync(join(f.stateDir, "user", `${broken}.json`), "");
+  const { messages, errors } = await actions.collect(f.options);
+  assert.deepEqual(messages.map(message => message.text), ["before"]);
+  assert.deepEqual(errors.map(error => error.key), [broken]);
+  assert.deepEqual(await actions.collect({ ...f.options, taken: [broken, messages[0].key] }), { messages: [] });
+});

@@ -350,7 +350,7 @@ export const actions = {
   },
 
   async collect(options = {}) {
-    return { messages: collectMail(stateDirectory(options.stateDir), options.taken) };
+    return collectMail(stateDirectory(options.stateDir), options.taken);
   },
 
   async rename(options, io = {}) {

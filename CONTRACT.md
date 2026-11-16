@@ -15,6 +15,7 @@ terminal reaches its agent directly and is never a message.
 <stateDir>/sessions/<id>.json   one record per session
 <stateDir>/locks/<id>           held while launching, registering, delivering or updating it
 <stateDir>/bin/control          written by register: runs core/control.mjs with node
+<stateDir>/user/<key>.json      the user's mail, one file per message
 version: 2
 id, role: "coordinator" | "thread"     id is core's own UUID, never the agent tool's
 coordinator                            its coordinator's id (its own for a coordinator)
@@ -81,7 +82,7 @@ errors print `projects: message` on stderr and exit 1. The same functions are `a
 | `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case, also on rename), at most 80 characters, not `coordinator` or `user`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
 | `open` | `{id, space?}` | Launches when stopped; returns once the terminal exists |
 | `send` | `{to, from?, text}` | As above; adds `sent` and `note?` |
-| `collect` | `{taken?: [key]}` | Removes the user's mail named in `taken`, then returns `{messages: [{key, from, title, id, text, created}]}`, oldest first. A client names what it handed over in its next call, so after a crash it gets it again. Refuses a key not of the form it returns |
+| `collect` | `{taken?: [key]}` | Removes the user's mail named in `taken`, then returns `{messages: [{key, from, title, id, text, created}], errors?}`, oldest first. A client names what it handed over in its next call, so after a crash it gets it again. A file that cannot be read is in `errors` as `{key, error}` and goes when named as taken. Refuses a key not of the form it returns |
 | `rename` | `{id, title, by}` | An agent cannot change a `user` title |
 | `order` | `{id, rank}` | |
 | `place` | `{id, space}` | Only when stopped |

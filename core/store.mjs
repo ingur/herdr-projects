@@ -76,17 +76,21 @@ export function writeMail(stateDir, message) {
   atomicWrite(join(stateDir, "user", `${last}-${randomUUID()}.json`), JSON.stringify(message, null, 2) + "\n", 0o600);
 }
 
-// Removes the mail named in `taken`, then returns what waits, oldest first.
+// Removes the mail named in `taken`, then returns what waits, oldest first. A file that cannot be read
+// (cut short by a crash, say) is listed in `errors` with its key, so it never hides the rest.
 export function collectMail(stateDir, taken = []) {
   if (!Array.isArray(taken) || taken.some(key => typeof key !== "string" || !KEY.test(key))) throw new Error("taken must be a list of keys from collect");
   for (const key of taken) rmSync(join(stateDir, "user", `${key}.json`), { force: true });
   let names;
   try { names = readdirSync(join(stateDir, "user")); }
-  catch (error) { if (error.code === "ENOENT") return []; throw error; }
-  return names.filter(name => name.endsWith(".json") && KEY.test(name.slice(0, -".json".length))).sort().flatMap(name => {
-    try { return [{ key: name.slice(0, -".json".length), ...JSON.parse(readFileSync(join(stateDir, "user", name), "utf8")) }]; }
-    catch (error) { if (error.code === "ENOENT") return []; throw error; }
-  });
+  catch (error) { if (error.code === "ENOENT") return { messages: [] }; throw error; }
+  const messages = [], errors = [];
+  for (const name of names.filter(name => name.endsWith(".json") && KEY.test(name.slice(0, -".json".length))).sort()) {
+    const key = name.slice(0, -".json".length);
+    try { messages.push({ key, ...JSON.parse(readFileSync(join(stateDir, "user", name), "utf8")) }); }
+    catch (error) { if (error.code !== "ENOENT") errors.push({ key, error: error.message }); }
+  }
+  return { messages, ...(errors.length ? { errors } : {}) };
 }
 
 export function alive(pid) {
