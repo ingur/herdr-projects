@@ -104,6 +104,7 @@ export default function projects(pi: ExtensionAPI) {
     const view = await actions.register({ ...(id ? { id } : { title: name || pi.getSessionName() }), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx, stateDir), terminal: process.env.HC_TERMINAL_ID, pid: process.pid });
     bind(stateDir, view);
     ctx.ui.notify(`Project ${view.title} uses this conversation.`, "info");
+    if (view.error) ctx.ui.notify(`Projects: ${view.error}`, "error");
   }
 
   pi.on("session_start", async (event, ctx) => {
@@ -115,7 +116,10 @@ export default function projects(pi: ExtensionAPI) {
     bind(stateDir, record);
     const binding = bound;
     // register returns once waiting mail is typed, which needs this Pi running, so do not wait for it.
-    actions.register({ id: record.id, cwd: ctx.cwd, agent: "pi", adapter: data, terminal, pid: process.pid }).catch(error => {
+    actions.register({ id: record.id, cwd: ctx.cwd, agent: "pi", adapter: data, terminal, pid: process.pid }).then(view => {
+      // The session is bound; `error` is the part that failed: a thread that would not start, mail that did not go out.
+      if (view.error) ctx.ui.notify(`Projects: ${view.error}`, "error");
+    }, error => {
       if (bound !== binding) return;
       unbind();
       applyTools();

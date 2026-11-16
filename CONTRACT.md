@@ -32,9 +32,9 @@ minutes, is taken over.
 A terminal holds a session while it is live, carries `projects.session=<id>`, and the process in
 its `projects.pid` is alive. `running`: it reports an agent status (`idle`, `working`, `done`,
 `blocked`, `error`). `starting`: no status yet, however long that takes. `stopped`: nothing holds
-it; a labelled terminal whose agent died is left behind, and the next launch clears its
-`projects.*` labels. Right before every `hc send` core checks that the terminal still holds the
-session and reports a status other than `blocked`.
+it; a terminal core started keeps the session's labels until the next launch, which starts the
+session in its tab again and closes it when it is an empty shell. Right before every `hc send`
+core checks that the terminal still holds the session and reports a status other than `blocked`.
 
 ## Messages
 
@@ -66,8 +66,8 @@ errors print `projects: message` on stderr and exit 1. The same functions are `a
 | Action | Options | Does |
 |---|---|---|
 | `list` | `{}` | `{sessions: [view], errors?}`: coordinators by rank, highest first, each followed by its threads, unresolved first, by rank |
-| `register` | `{id?, title?, cwd, agent, adapter, terminal, pid}` | Binds the conversation in an hc terminal; `pid` is the agent's own process. Without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another terminal holds the session. Labels the terminal, saves `adapter`, `cwd` and placement, reopens unresolved `reopenWithProject` threads, delivers waiting mail |
-| `release` | `{id}` | The session leaves its terminal: `projects.*` labels go; a coordinator's running threads are closed and flagged `reopenWithProject` |
+| `register` | `{id?, title?, cwd, agent, adapter, terminal, pid}` | Binds the conversation in an hc terminal; `pid` is the agent's own process. Without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another terminal holds the session. Labels the terminal, saves `adapter`, `cwd` and placement, clears what the session left elsewhere, reopens its unresolved threads that were open, delivers waiting mail |
+| `release` | `{id}` | The session leaves its terminal: a terminal core started keeps the session's labels and loses `projects.pid`, a terminal the user started loses every `projects.*` label; a coordinator's running threads are closed and flagged `reopenWithProject` |
 | `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case, also on rename), at most 80 characters, not `coordinator`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
 | `open` | `{id, space?}` | Launches when stopped; returns once the terminal exists |
 | `send` | `{to, from?, text}` | As above; adds `sent` and `note?` |
@@ -88,14 +88,22 @@ status (hc's word, only when running), waiting (count), error?
 
 ## Launching and labels
 
-`hc run --bg --json --no-parent --cwd CWD --name SLUG-ID8 [--label herdr.space=S --label
-herdr.tab=T] --label projects.session=ID --label projects.control=… -- env K=V …
+`hc run --bg --json --no-parent --cwd CWD [--label herdr.space=S --label herdr.tab=T] --label
+projects.session=ID --label projects.control=… --label projects.launched=1 -- env K=V …
 PROJECTS_SESSION=ID <adapter argv>`, then `projects.pid` from the pid hc reports (`env` execs the
 agent); an hc that reports no pid (before 0.1.20) fails the launch. A thread starts in its
 coordinator's space while that runs, else in its recorded space, else unplaced. A failed `hc run`
 gives an `error`; mail stays.
 
-- `projects.session=<id>`: the terminal running that session.
+Afterwards, and at every `register`, the terminals still labelled with the session that do not hold
+it are read again: one core started that is an empty shell (no status, nothing of its own in the
+foreground) is killed, every other one loses its `projects.*` labels. A launch starts its new
+terminal before that, so the tab and its space stay alive. A thread is reopened with its project
+when it is flagged `reopenWithProject` or left a terminal of core's behind: a reboot takes
+everything down at once, so the flag may never be written.
+
+- `projects.session=<id>`: the terminal running that session, and the one waiting for it while it is stopped.
+- `projects.launched=1`: core started this terminal; a terminal the user started never carries it.
 - `projects.pid=<pid>`: the agent process; the terminal counts only while it is alive.
 - `projects.control={"version":2,"command":["<stateDir>/bin/control"],"stateDir":"…"}`.
 - `projects.changed=<ms>`: set after a change, on the session's terminal or its coordinator's.
@@ -155,4 +163,6 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
 - A picker open in the agent swallows a message; when the agent was working this is silent.
 - A draft left untouched for 60 s stops holding messages (hc's `draft_wait`).
 - A tool that asks a startup question reports no status until it is answered; mail waits.
+- A reboot (or an hc restart) brings a session's tab back as a shell: the session shows `stopped`
+  until it is opened again, which starts it in that tab and closes the empty shell.
 - Requires hc 0.1.20 or newer.

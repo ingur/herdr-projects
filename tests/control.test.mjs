@@ -28,7 +28,9 @@ function fixture(t) {
   // Labels of a terminal bound to a session, as register and launch set them.
   const bound = (id, pid = process.pid) => ({ "projects.session": id, "projects.pid": String(pid),
     "projects.control": JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir }) });
-  return { root, stateDir, cwd, agentDir, adapter, save, transcript, bound, options: { stateDir } };
+  // What a launch leaves behind: the labels it set, the agent's pid gone.
+  const left = id => { const labels = { ...bound(id), "projects.launched": "1" }; delete labels["projects.pid"]; return labels; };
+  return { root, stateDir, cwd, agentDir, adapter, save, transcript, bound, left, options: { stateDir } };
 }
 
 // A fake hc: `ls` gives short rows, `get` the full terminal with status as {app, state}.
@@ -186,6 +188,45 @@ test("a stopped thread is launched under its live pid and gets its mail", async 
   const launched = io.rows.at(-1);
   assert.equal(launched.labels["projects.pid"], String(process.pid));
   assert.deepEqual(launched.typed, [wrap({ from: "coordinator", title: coordinator.title, id: coordinator.id, text: "work" })]);
+});
+
+test("reopening a session starts it in its tab, then closes the empty shell it left there", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  // What a reboot leaves: the terminals core started, back as shells, one of them busy, and one of the user's.
+  const empty = io.terminal(f.left(thread.id), null), busy = io.terminal(f.left(thread.id), null), own = io.terminal(f.bound(thread.id, DEAD), null);
+  empty.foreground = { pid: empty.pid };
+  busy.foreground = { pid: 4242 };
+  own.foreground = { pid: own.pid };
+  await actions.open({ ...f.options, id: thread.id }, io);
+  const [run] = verbs(io, "run"), order = io.calls.map(args => `${args[0]} ${args[1]}`);
+  assert.equal(run.slice(0, run.indexOf("--")).includes("--name"), false, "hc gives the terminal no name, so one left behind never takes the next one's");
+  assert.ok(run.includes("projects.launched=1"), "core marks what it started");
+  assert.ok(order.indexOf("run --bg") < order.indexOf(`kill ${empty.address}`), "the tab and its space stay alive until the session is back in them");
+  assert.equal(empty.state, "finished");
+  assert.deepEqual([busy.state, busy.labels], ["live", {}], "what the user runs there keeps its terminal");
+  assert.deepEqual([own.state, own.labels], ["live", {}], "a terminal the user started is only unlabelled");
+  assert.equal(io.rows.at(-1).labels["projects.pid"], String(process.pid));
+});
+
+test("release keeps the terminal core started for the session and gives the user's back", async t => {
+  const f = fixture(t), io = hc(), started = f.save(), own = f.save({ title: "Other" });
+  const launched = io.terminal({ ...f.left(started.id), "projects.pid": String(process.pid) }), user = io.terminal(f.bound(own.id));
+  await actions.release({ ...f.options, id: started.id }, io);
+  await actions.release({ ...f.options, id: own.id }, io);
+  assert.deepEqual(launched.labels, f.left(started.id), "it waits for the session; only the agent's pid is gone");
+  assert.deepEqual(user.labels, {}, "the user's own terminal is theirs again");
+});
+
+test("register reopens a thread that left a terminal of core's behind, with no flag to go by", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
+  const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const empty = io.terminal(f.left(thread.id), null);
+  empty.foreground = { pid: empty.pid };
+  const terminal = io.terminal({});
+  await actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: coordinator.adapter, terminal: terminal.address, pid: process.pid }, io);
+  assert.equal(verbs(io, "run").length, 1, "the thread it left behind is started again");
+  assert.equal(empty.state, "finished");
+  assert.equal(io.rows.at(-1).labels["projects.session"], thread.id);
 });
 
 test("double launch is refused", async t => {

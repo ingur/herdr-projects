@@ -15,7 +15,7 @@ const STORED = {
   blocked: "stored; the session is waiting on the user",
   coordinator: "stored; it goes out when the user resumes the project",
 };
-const UNLABEL = ["projects.session=", "projects.pid=", "projects.control=", "projects.changed="];
+const UNLABEL = ["projects.session=", "projects.pid=", "projects.control=", "projects.changed=", "projects.launched="];
 const errorText = error => error instanceof Error ? error.message : String(error);
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const descriptor = stateDir => JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir });
@@ -47,10 +47,6 @@ function messageText(value) {
 function space(value) {
   if (typeof value !== "string" || !value || /[\x00-\x1f\x7f]/.test(value)) throw new Error("space must be a Herdr space id");
   return value;
-}
-function terminalName(record) {
-  const slug = record.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 23).replace(/-+$/, "");
-  return `${slug ? `${slug}-` : ""}${record.id.slice(0, 8)}`;
 }
 
 const escape = value => value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -132,12 +128,24 @@ async function deliver(stateDir, id, io, seconds = 0) {
   } catch (error) { return { error: errorText(error) }; }
 }
 
+// What a session left behind: terminals that carry its label without holding it. One core started
+// and that is an empty shell again (no status, nothing of its own in the foreground, read again
+// right before) waits for nothing and is closed; a terminal of the user's only loses the labels.
+async function vacate(io, rows, id, address) {
+  for (const row of rows) {
+    if (row.address === address) continue;
+    const current = await hc(io, ["get", row.address, "--json"]);
+    if (current.state === "live" && current.labels?.["projects.session"] === id && current.labels["projects.launched"]
+      && !statusWord(current.status) && current.foreground?.pid === current.pid) await hc(io, ["kill", row.address, "--json"]);
+    else await hc(io, ["label", row.address, "--json", ...UNLABEL]);
+  }
+}
+
 async function launch(stateDir, id, io, place) {
   try {
     return await locked(stateDir, id, async () => {
       const record = session(stateDir, id), observed = await observe(io, id);
       if (observed.state !== "stopped") return {};
-      for (const row of observed.labelled) await hc(io, ["label", row.address, "--json", ...UNLABEL]);
       let target = place ?? record.space;
       if (place === undefined && record.role === "thread") target = (await observe(io, record.coordinator)).terminal?.labels["herdr.space"] ?? target;
       const tab = target === undefined ? undefined : record.tab ?? `pt-${id}`;
@@ -145,14 +153,16 @@ async function launch(stateDir, id, io, place) {
       const module = await adapter(record.agent), coordinator = session(stateDir, record.coordinator);
       const argv = module.resume(record, coordinator) ?? module.start(record, coordinator);
       const env = Object.entries(module.env(coordinator)).map(([key, value]) => `${key}=${value}`);
-      const { address } = await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd, "--name", terminalName(record),
+      const { address } = await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd,
         ...(target === undefined ? [] : ["--label", `herdr.space=${target}`, "--label", `herdr.tab=${tab}`]),
-        "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`,
+        "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`, "--label", "projects.launched=1",
         "--", "env", ...env, `PROJECTS_SESSION=${id}`, ...argv]);
       // With `env … agent`, env execs the agent, so the program pid hc reports is the agent's.
       const { pid } = await hc(io, ["get", address, "--json"]);
       if (!pid) throw new Error("Needs hc 0.1.20 or newer");
       await hc(io, ["label", address, "--json", `projects.pid=${pid}`]);
+      // Starting first keeps the tab and the space alive; what the session left behind goes after.
+      await vacate(io, observed.labelled, id, address);
       rewrite(stateDir, id, () => ({ space: target, tab }));
       return {};
     }, io);
@@ -226,9 +236,9 @@ export const actions = {
         const observed = await observe(io, id);
         const other = observed.labelled.find(live => live.address !== row.address && holds(live, id));
         if (other) throw new Error(`This session is already open in terminal ${other.address}`);
-        // Terminals an agent of this session died in keep its labels; they are plain shells again.
-        for (const left of observed.labelled) if (left.address !== row.address) await hc(io, ["label", left.address, "--json", ...UNLABEL]);
         await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}`, `projects.control=${descriptor(stateDir)}`]);
+        // The user started this terminal, so it carries no `projects.launched`; what the session left elsewhere goes.
+        await vacate(io, observed.labelled, id, row.address);
         rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,
           space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }));
       }, io);
@@ -237,8 +247,12 @@ export const actions = {
       throw error;
     }
     writeShim(stateDir);
-    const errors = [];
-    await Promise.all(threads(stateDir, id).filter(thread => thread.reopenWithProject).map(async thread => {
+    const errors = [], children = threads(stateDir, id);
+    // A reboot takes the whole project down at once, so `reopenWithProject` may never be written;
+    // a thread that left a terminal of core's behind was open too.
+    const rows = children.length ? await snapshot(io, stateDir, session(stateDir, id)) : [];
+    const left = thread => { const { state, labelled } = classify(rows, thread.id); return state === "stopped" && labelled.some(row => row.labels["projects.launched"]); };
+    await Promise.all(children.filter(thread => thread.reopenWithProject || left(thread)).map(async thread => {
       await update(stateDir, thread.id, () => ({ reopenWithProject: undefined }), io);
       if (thread.resolved) return;
       const { error } = await launch(stateDir, thread.id, io);
@@ -251,9 +265,10 @@ export const actions = {
 
   async release(options, io = {}) {
     const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), rows = await snapshot(io, stateDir, record);
+    // A terminal core started keeps the session's labels: it waits for the session. The user's own is theirs again.
     for (const row of classify(rows, record.id).labelled) {
       await remember(stateDir, record.id, row, io);
-      await hc(io, ["label", row.address, "--json", ...UNLABEL]);
+      await hc(io, ["label", row.address, "--json", ...(row.labels["projects.launched"] ? ["projects.pid="] : UNLABEL)]);
     }
     if (record.role === "coordinator") await closeThreads(stateDir, record.id, io, rows);
     return changed(stateDir, record.id, io);
