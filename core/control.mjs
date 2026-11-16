@@ -171,17 +171,24 @@ async function launch(stateDir, id, io, place) {
 
 // hc has no conditional kill: the label is read again right before it.
 async function stop(stateDir, id, io, rows) {
-  const { terminal } = classify(rows, id);
-  if (!terminal) return;
-  const current = await hc(io, ["get", terminal.address, "--json"]);
-  if (!holds(current, id)) return;
-  await remember(stateDir, id, current, io);
-  const killed = await hc(io, ["kill", current.address, "--json"]);
-  if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
+  const { terminal, labelled } = classify(rows, id);
+  const current = terminal && await hc(io, ["get", terminal.address, "--json"]);
+  if (current && holds(current, id)) {
+    await remember(stateDir, id, current, io);
+    const killed = await hc(io, ["kill", current.address, "--json"]);
+    if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
+  }
+  await vacate(io, labelled, id, terminal?.address);
+}
+
+// A thread is open while an agent sits in its terminal, or a terminal core started still waits for it.
+function isOpen(rows, id) {
+  const { terminal, labelled } = classify(rows, id);
+  return terminal || labelled.some(row => row.labels["projects.launched"]);
 }
 
 async function closeThreads(stateDir, coordinator, io, rows) {
-  await Promise.all(threads(stateDir, coordinator).filter(thread => classify(rows, thread.id).terminal).map(async thread => {
+  await Promise.all(threads(stateDir, coordinator).filter(thread => isOpen(rows, thread.id)).map(async thread => {
     await update(stateDir, thread.id, () => ({ reopenWithProject: true }), io);
     await stop(stateDir, thread.id, io, rows);
   }));
@@ -251,8 +258,7 @@ export const actions = {
     // A reboot takes the whole project down at once, so `reopenWithProject` may never be written;
     // a thread that left a terminal of core's behind was open too.
     const rows = children.length ? await snapshot(io, stateDir, session(stateDir, id)) : [];
-    const left = thread => { const { state, labelled } = classify(rows, thread.id); return state === "stopped" && labelled.some(row => row.labels["projects.launched"]); };
-    await Promise.all(children.filter(thread => thread.reopenWithProject || left(thread)).map(async thread => {
+    await Promise.all(children.filter(thread => thread.reopenWithProject || isOpen(rows, thread.id)).map(async thread => {
       await update(stateDir, thread.id, () => ({ reopenWithProject: undefined }), io);
       if (thread.resolved) return;
       const { error } = await launch(stateDir, thread.id, io);

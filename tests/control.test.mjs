@@ -229,6 +229,14 @@ test("register reopens a thread that left a terminal of core's behind, with no f
   assert.equal(io.rows.at(-1).labels["projects.session"], thread.id);
 });
 
+test("deleting a project also closes the empty shells its sessions left behind", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const empty = io.terminal(f.left(thread.id), null), other = io.terminal({ "herdr.space": "s" }, null);
+  empty.foreground = { pid: empty.pid };
+  await actions.delete({ ...f.options, id: coordinator.id }, io);
+  assert.deepEqual([empty.state, other.state], ["finished", "live"]);
+});
+
 test("double launch is refused", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
   const first = io.terminal({}), second = io.terminal({});

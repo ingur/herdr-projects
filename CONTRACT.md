@@ -100,7 +100,7 @@ it are read again: one core started that is an empty shell (no status, nothing o
 foreground) is killed, every other one loses its `projects.*` labels. A launch starts its new
 terminal before that, so the tab and its space stay alive. A thread is reopened with its project
 when it is flagged `reopenWithProject` or left a terminal of core's behind: a reboot takes
-everything down at once, so the flag may never be written.
+everything down at once, so the flag may never be written. `close`, `resolve` and `delete` do the same to what a stopped session left.
 
 - `projects.session=<id>`: the terminal running that session, and the one waiting for it while it is stopped.
 - `projects.launched=1`: core started this terminal; a terminal the user started never carries it.
