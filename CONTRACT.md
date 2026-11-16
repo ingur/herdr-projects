@@ -29,8 +29,9 @@ minutes, is taken over.
 
 ## Running
 
-A terminal holds a session while it is live, carries `projects.session=<id>`, and the process in
-its `projects.pid` is alive. `running`: it reports an agent status (`idle`, `working`, `done`,
+A terminal holds a session while it is live, carries `projects.session=<id>`, still runs the
+program named in its `projects.pid`, and the agent process named there is alive. `running`: it
+reports an agent status (`idle`, `working`, `done`,
 `blocked`, `error`). `starting`: no status yet, however long that takes. `stopped`: nothing holds
 it; a terminal core started keeps the session's labels until the next launch, which starts the
 session in its tab again and closes it when it is an empty shell. Right before every `hc send`
@@ -105,7 +106,7 @@ everything down at once, so the flag may never be written. `close`, `resolve` an
 
 - `projects.session=<id>`: the terminal running that session, and the one waiting for it while it is stopped.
 - `projects.launched=1`: core started this terminal; a terminal the user started never carries it.
-- `projects.pid=<pid>`: the agent process; the terminal counts only while it is alive.
+- `projects.pid=<agent pid>@<terminal pid>`: the agent process and the program hc ran in the terminal when it was bound (`pid` of `hc get`). A terminal hc brings back after a restart has another, so it never holds.
 - `projects.control={"version":2,"command":["<stateDir>/bin/control"],"stateDir":"…"}`.
 - `projects.changed=<ms>`: set after a change, on the session's terminal or its coordinator's.
 
@@ -158,7 +159,7 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
 
 - Messages are typed text by convention, not a security boundary. If one ever reached a shell,
   its first line fails, but later lines of a multi-line message would run.
-- After a hard kill, another process that gets the same pid makes the terminal look alive.
+- After a hard kill without a restart, another process that gets the agent's pid makes the terminal look alive.
 - The pid check needs control, hc and the agents in one process namespace: same machine, no
   container or sandbox between them.
 - A picker open in the agent swallows a message; when the agent was working this is silent.

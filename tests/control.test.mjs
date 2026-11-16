@@ -26,7 +26,7 @@ function fixture(t) {
     return path;
   };
   // Labels of a terminal bound to a session, as register and launch set them.
-  const bound = (id, pid = process.pid) => ({ "projects.session": id, "projects.pid": String(pid),
+  const bound = (id, pid = process.pid) => ({ "projects.session": id, "projects.pid": `${pid}@${process.pid}`,
     "projects.control": JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir }) });
   // What a launch leaves behind: the labels it set, the agent's pid gone.
   const left = id => { const labels = { ...bound(id), "projects.launched": "1" }; delete labels["projects.pid"]; return labels; };
@@ -156,9 +156,10 @@ test("a thread launches with its coordinator's current command", async t => {
   // The thread's own register stored the command it ran under, which has since moved.
   const sessionId = randomUUID(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker", reopenWithProject: true,
     adapter: { sessionId, command: ["/old/node", "/old/pi"], env: { PATH: "/old" } } });
-  const moved = { ...coordinator.adapter, command: ["/new/node", "/new/pi"], env: { PATH: "/new" } };
+  const moved = { ...coordinator.adapter, command: [process.execPath, "pi"], env: { PATH: "/new" } };
   await actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: moved, terminal: io.terminal({}).address, pid: process.pid }, io);
-  assert.deepEqual(io.rows.at(-1).argv, ["env", "PATH=/new", `PROJECTS_SESSION=${thread.id}`, "/new/node", "/new/pi", "--session-id", sessionId]);
+  assert.deepEqual(io.rows.at(-1).argv, ["env", "PATH=/new", `PROJECTS_SESSION=${thread.id}`, process.execPath, "pi", "--session-id", sessionId]);
+  assert.match((await actions.open({ ...f.options, id: f.save({ adapter: { command: ["/gone/pi"] } }).id }, io)).error, /no longer at \/gone\/pi/);
 });
 
 test("a terminal counts only while the agent process it names is alive", async t => {
@@ -186,7 +187,7 @@ test("a stopped thread is launched under its live pid and gets its mail", async 
   assert.deepEqual(shell.typed, []);
   assert.equal(shell.labels["projects.session"], undefined, "launching cleared the label left behind");
   const launched = io.rows.at(-1);
-  assert.equal(launched.labels["projects.pid"], String(process.pid));
+  assert.equal(launched.labels["projects.pid"], `${process.pid}@${process.pid}`);
   assert.deepEqual(launched.typed, [wrap({ from: "coordinator", title: coordinator.title, id: coordinator.id, text: "work" })]);
 });
 
@@ -205,12 +206,12 @@ test("reopening a session starts it in its tab, then closes the empty shell it l
   assert.equal(empty.state, "finished");
   assert.deepEqual([busy.state, busy.labels], ["live", {}], "what the user runs there keeps its terminal");
   assert.deepEqual([own.state, own.labels], ["live", {}], "a terminal the user started is only unlabelled");
-  assert.equal(io.rows.at(-1).labels["projects.pid"], String(process.pid));
+  assert.equal(io.rows.at(-1).labels["projects.pid"], `${process.pid}@${process.pid}`);
 });
 
 test("release keeps the terminal core started for the session and gives the user's back", async t => {
   const f = fixture(t), io = hc(), started = f.save(), own = f.save({ title: "Other" });
-  const launched = io.terminal({ ...f.left(started.id), "projects.pid": String(process.pid) }), user = io.terminal(f.bound(own.id));
+  const launched = io.terminal({ ...f.left(started.id), ...f.bound(started.id) }), user = io.terminal(f.bound(own.id));
   await actions.release({ ...f.options, id: started.id }, io);
   await actions.release({ ...f.options, id: own.id }, io);
   assert.deepEqual(launched.labels, f.left(started.id), "it waits for the session; only the agent's pid is gone");
@@ -246,6 +247,16 @@ test("cleanup leaves a terminal reassigned to another session alone", async t =>
   await actions.close({ ...f.options, id: thread.id }, io);
   assert.equal(row.state, "live");
   assert.deepEqual(row.labels, replacement);
+});
+
+test("a shell hc brought back does not hold the session, even when the agent's old pid is taken", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  const restored = io.terminal({ ...f.left(thread.id), ...f.bound(thread.id) }, null);
+  restored.pid = process.pid + 1;
+  restored.foreground = { pid: restored.pid };
+  assert.equal((await actions.list(f.options, io)).sessions.find(view => view.id === thread.id).state, "stopped");
+  await actions.open({ ...f.options, id: thread.id }, io);
+  assert.deepEqual([verbs(io, "run").length, restored.state], [1, "finished"]);
 });
 
 test("double launch is refused", async t => {

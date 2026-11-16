@@ -24,9 +24,11 @@ export function statusWord(status) {
   return typeof status === "string" ? status : status?.state;
 }
 
-// A labelled terminal holds the session only while the agent process named by projects.pid is alive.
+// projects.pid is `<agent pid>@<terminal pid>`. A terminal holds the session while that agent is alive
+// and the terminal still runs the program it ran then: one hc brought back after a restart has a new pid.
 export function holds(row, id) {
-  return row.state === "live" && row.labels?.["projects.session"] === id && alive(Number(row.labels["projects.pid"]));
+  const [agent, terminal] = (row.labels?.["projects.pid"] ?? "").split("@");
+  return row.state === "live" && row.labels?.["projects.session"] === id && Number(terminal) === row.pid && alive(Number(agent));
 }
 
 // `running` once the agent reports a status, `starting` while it is alive without one, else `stopped`.

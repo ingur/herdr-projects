@@ -161,7 +161,7 @@ async function launch(stateDir, id, io, place) {
       // With `env … agent`, env execs the agent, so the program pid hc reports is the agent's.
       const { pid } = await hc(io, ["get", address, "--json"]);
       if (!pid) throw new Error("Needs hc 0.1.20 or newer");
-      await hc(io, ["label", address, "--json", `projects.pid=${pid}`]);
+      await hc(io, ["label", address, "--json", `projects.pid=${pid}@${pid}`]);
       // Starting first keeps the tab and the space alive; what the session left behind goes after.
       await vacate(io, observed.labelled, id, address);
       rewrite(stateDir, id, () => ({ space: target, tab }));
@@ -244,7 +244,7 @@ export const actions = {
         const observed = await observe(io, id);
         const other = observed.labelled.find(live => live.address !== row.address && holds(live, id));
         if (other) throw new Error(`This session is already open in terminal ${other.address}`);
-        await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}`, `projects.control=${descriptor(stateDir)}`]);
+        await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}@${row.pid}`, `projects.control=${descriptor(stateDir)}`]);
         // The user started this terminal, so it carries no `projects.launched`; what the session left elsewhere goes.
         await vacate(io, observed.labelled, id, row.address);
         rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,

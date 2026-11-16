@@ -10,6 +10,7 @@ function command(record) {
   if (!Array.isArray(command) || !command.length || command.some(arg => typeof arg !== "string" || !arg)) {
     throw new Error("No Pi command is recorded for this project; open the project in Pi once to record it");
   }
+  if (isAbsolute(command[0]) && !existsSync(command[0])) throw new Error(`Pi is no longer at ${command[0]}; start Pi and use /projects resume`);
   return command;
 }
 
