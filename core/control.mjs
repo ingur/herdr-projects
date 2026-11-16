@@ -170,8 +170,9 @@ async function launch(stateDir, id, io, place) {
   } catch (error) { return { error: errorText(error) }; }
 }
 
-// hc has no conditional kill: the label is read again right before it.
-async function stop(stateDir, id, io, rows) {
+// hc has no conditional kill: the label is read again right before it. A delete leaves no session to
+// wait for, so it also takes the labels off a terminal it leaves running.
+async function stop(stateDir, id, io, rows, unlabel = false) {
   const { terminal, labelled } = classify(rows, id);
   const current = terminal && await hc(io, ["get", terminal.address, "--json"]);
   if (current && holds(current, id)) {
@@ -179,7 +180,7 @@ async function stop(stateDir, id, io, rows) {
     const killed = await hc(io, ["kill", current.address, "--json"]);
     if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
   }
-  await vacate(io, labelled, id, terminal?.address, false);
+  await vacate(io, labelled, id, terminal?.address, unlabel);
 }
 
 // A thread is open while an agent sits in its terminal, or a terminal core started still waits for it.
@@ -399,7 +400,7 @@ export const actions = {
   async delete(options, io = {}) {
     const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), rows = await snapshot(io, stateDir, record);
     const remove = async target => {
-      await stop(stateDir, target.id, io, rows);
+      await stop(stateDir, target.id, io, rows, true);
       (await adapter(target.agent)).remove(session(stateDir, target.id));
       removeRecord(stateDir, target.id);
       return target.id;

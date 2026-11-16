@@ -104,7 +104,8 @@ terminal before that, so the tab and its space stay alive. A thread is launched 
 when it is flagged `reopenWithProject` or left a terminal of core's behind: a reboot takes
 everything down at once, so the flag may never be written. Stopping a session (`close`, `resolve`,
 `delete`, and a coordinator's `release` for its threads) also kills an empty shell core started
-for it, but leaves every other terminal as it is.
+for it, but leaves every other terminal as it is; only `delete`, which leaves no session to wait
+for, takes the `projects.*` labels off one it leaves running.
 
 - `projects.session=<id>`: the terminal running that session, and the one waiting for it while it is stopped.
 - `projects.launched=1`: core started this terminal; a terminal the user started never carries it.

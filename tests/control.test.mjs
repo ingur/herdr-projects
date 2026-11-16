@@ -246,12 +246,14 @@ test("register launches a thread that left a terminal of core's behind, with no 
   assert.equal(io.rows.at(-1).labels["projects.session"], thread.id);
 });
 
-test("deleting a project also closes the empty shells its sessions left behind", async t => {
+test("deleting a project closes the empty shells its sessions left behind and unlabels a busy one", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
-  const empty = io.terminal(f.left(thread.id), null), other = io.terminal({ "herdr.space": "s" }, null);
+  const empty = io.terminal(f.left(thread.id), null), busy = io.terminal(f.left(thread.id), null), other = io.terminal({ "herdr.space": "s" }, null);
   empty.foreground = { pid: empty.pid };
+  busy.foreground = { pid: 4242 };
   await actions.delete({ ...f.options, id: coordinator.id }, io);
-  assert.deepEqual([empty.state, other.state], ["finished", "live"]);
+  assert.deepEqual([empty.state, busy.state, other.state], ["finished", "live", "live"]);
+  assert.deepEqual(busy.labels, {}, "no session is left for it to wait for");
 });
 
 test("cleanup leaves a terminal reassigned to another session alone", async t => {
