@@ -96,8 +96,9 @@ coordinator's space while that runs, else in its recorded space, else unplaced. 
 gives an `error`; mail stays.
 
 Afterwards, and at every `register`, the terminals still labelled with the session that do not hold
-it are read again: one core started that is an empty shell (no status, nothing of its own in the
-foreground) is killed, every other one loses its `projects.*` labels. A launch starts its new
+it are read again. A terminal no longer live or labelled with this session is left alone. One core
+started that is an empty shell (no status, nothing of its own in the foreground) is killed; every
+other one loses its `projects.*` labels. A launch starts its new
 terminal before that, so the tab and its space stay alive. A thread is reopened with its project
 when it is flagged `reopenWithProject` or left a terminal of core's behind: a reboot takes
 everything down at once, so the flag may never be written. `close`, `resolve` and `delete` do the same to what a stopped session left.

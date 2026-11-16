@@ -237,6 +237,17 @@ test("deleting a project also closes the empty shells its sessions left behind",
   assert.deepEqual([empty.state, other.state], ["finished", "live"]);
 });
 
+test("cleanup leaves a terminal reassigned to another session alone", async t => {
+  const f = fixture(t), io = hc(), thread = f.save({ role: "thread", coordinator: randomUUID() });
+  const row = io.terminal(f.left(thread.id), null), replacement = f.bound(randomUUID());
+  row.foreground = { pid: row.pid };
+  let gets = 0;
+  io.onGet = found => { if (found === row && ++gets === 2) row.labels = { ...replacement }; };
+  await actions.close({ ...f.options, id: thread.id }, io);
+  assert.equal(row.state, "live");
+  assert.deepEqual(row.labels, replacement);
+});
+
 test("double launch is refused", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
   const first = io.terminal({}), second = io.terminal({});

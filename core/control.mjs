@@ -135,8 +135,9 @@ async function vacate(io, rows, id, address) {
   for (const row of rows) {
     if (row.address === address) continue;
     const current = await hc(io, ["get", row.address, "--json"]);
-    if (current.state === "live" && current.labels?.["projects.session"] === id && current.labels["projects.launched"]
-      && !statusWord(current.status) && current.foreground?.pid === current.pid) await hc(io, ["kill", row.address, "--json"]);
+    if (current.state !== "live" || current.labels?.["projects.session"] !== id) continue;
+    if (current.labels["projects.launched"] && !statusWord(current.status)
+      && current.foreground?.pid === current.pid) await hc(io, ["kill", row.address, "--json"]);
     else await hc(io, ["label", row.address, "--json", ...UNLABEL]);
   }
 }

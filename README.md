@@ -35,6 +35,7 @@ The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `threa
 
 - Your typing always comes first. Messages from other sessions wait.
 - Closing a project closes its threads. Resuming it brings back the ones that were open.
+- After a reboot, projects stay stopped until you open one from the sidebar or use `/projects resume`. Its previously open, unresolved threads come back too. A shell you started yourself is kept.
 - A report to a closed project waits until you resume it.
 - Write in a resolved thread to reopen it.
 - Only you can delete.
