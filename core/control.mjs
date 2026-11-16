@@ -4,8 +4,8 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { adapter, agents } from "./adapters.mjs";
-import { classify, details, hc, holds, observe, statusWord } from "./hc.mjs";
+import { adapter } from "./adapters.mjs";
+import { classify, details, hc, holds, observe } from "./hc.mjs";
 import { findRecord, locked, readRecord, readRecords, removeRecord, rewrite, stateDirectory, update, writeExecutable, writeRecord } from "./store.mjs";
 
 export { findRecord, readRecord, stateDirectory };
@@ -101,7 +101,7 @@ async function running(io, id, seconds) {
 // Right before typing, the terminal must still hold the session (label and live agent pid) and report a status.
 async function type(io, id, address, message) {
   const row = await hc(io, ["get", address, "--json"]);
-  const status = statusWord(row.status);
+  const status = row.status?.state;
   if (!holds(row, id)) return { held: "stopped" };
   if (!status) return { held: "starting" };
   if (status === "blocked") return { held: "blocked" };
@@ -130,15 +130,15 @@ async function deliver(stateDir, id, io, seconds = 0) {
 
 // What a session left behind: terminals that carry its label without holding it. One core started
 // and that is an empty shell again (no status, nothing of its own in the foreground, read again
-// right before) waits for nothing and is closed; a terminal of the user's only loses the labels.
-async function vacate(io, rows, id, address) {
+// right before) waits for nothing and is closed; any other loses the labels, unless the session only stops.
+async function vacate(io, rows, id, address, unlabel = true) {
   for (const row of rows) {
     if (row.address === address) continue;
     const current = await hc(io, ["get", row.address, "--json"]);
     if (current.state !== "live" || current.labels?.["projects.session"] !== id) continue;
-    if (current.labels["projects.launched"] && !statusWord(current.status)
+    if (current.labels["projects.launched"] && !current.status?.state
       && current.foreground?.pid === current.pid) await hc(io, ["kill", row.address, "--json"]);
-    else await hc(io, ["label", row.address, "--json", ...UNLABEL]);
+    else if (unlabel) await hc(io, ["label", row.address, "--json", ...UNLABEL]);
   }
 }
 
@@ -150,17 +150,17 @@ async function launch(stateDir, id, io, place) {
       let target = place ?? record.space;
       if (place === undefined && record.role === "thread") target = (await observe(io, record.coordinator)).terminal?.labels["herdr.space"] ?? target;
       const tab = target === undefined ? undefined : record.tab ?? `pt-${id}`;
-      // A thread starts the way its coordinator last registered, so it follows a Node or Pi upgrade.
+      // A thread starts the way its coordinator last registered, so it follows an upgrade of the agent.
       const module = await adapter(record.agent), coordinator = session(stateDir, record.coordinator);
       const argv = module.resume(record, coordinator) ?? module.start(record, coordinator);
       const env = Object.entries(module.env(coordinator)).map(([key, value]) => `${key}=${value}`);
       const { address } = await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd,
         ...(target === undefined ? [] : ["--label", `herdr.space=${target}`, "--label", `herdr.tab=${tab}`]),
         "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`, "--label", "projects.launched=1",
-        "--", "env", ...env, `PROJECTS_SESSION=${id}`, ...argv]);
+        "--", "env", ...env, `PROJECTS_SESSION=${id}`, `PROJECTS_STATE_DIR=${stateDir}`, ...argv]);
       // With `env … agent`, env execs the agent, so the program pid hc reports is the agent's.
       const { pid } = await hc(io, ["get", address, "--json"]);
-      if (!pid) throw new Error("Needs hc 0.1.20 or newer");
+      if (!pid) throw new Error("hc reported no pid for the new terminal");
       await hc(io, ["label", address, "--json", `projects.pid=${pid}@${pid}`]);
       // Starting first keeps the tab and the space alive; what the session left behind goes after.
       await vacate(io, observed.labelled, id, address);
@@ -179,7 +179,7 @@ async function stop(stateDir, id, io, rows) {
     const killed = await hc(io, ["kill", current.address, "--json"]);
     if (killed.state !== "finished") throw new Error(`hc could not stop terminal ${current.address}`);
   }
-  await vacate(io, labelled, id, terminal?.address);
+  await vacate(io, labelled, id, terminal?.address, false);
 }
 
 // A thread is open while an agent sits in its terminal, or a terminal core started still waits for it.
@@ -224,7 +224,7 @@ export const actions = {
 
   async register(options, io = {}) {
     const stateDir = stateDirectory(options.stateDir);
-    if (!agents.includes(options.agent)) throw new Error(`No adapter for agent ${JSON.stringify(options.agent)}`);
+    await adapter(options.agent);
     if (typeof options.cwd !== "string" || !isAbsolute(options.cwd)) throw new Error("cwd must be an absolute path");
     if (!options.adapter || typeof options.adapter !== "object" || Array.isArray(options.adapter)) throw new Error("adapter must be an object");
     if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name an hc terminal");
@@ -245,7 +245,7 @@ export const actions = {
         const other = observed.labelled.find(live => live.address !== row.address && holds(live, id));
         if (other) throw new Error(`This session is already open in terminal ${other.address}`);
         await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}@${row.pid}`, `projects.control=${descriptor(stateDir)}`]);
-        // The user started this terminal, so it carries no `projects.launched`; what the session left elsewhere goes.
+        // Only a launch sets `projects.launched`; what the session left elsewhere goes.
         await vacate(io, observed.labelled, id, row.address);
         rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,
           space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }));
@@ -384,7 +384,7 @@ export const actions = {
     return changed(stateDir, record.id, io);
   },
 
-  async reopen(options, io = {}) {
+  async unresolve(options, io = {}) {
     const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
     await update(stateDir, record.id, () => ({ resolved: false }), io);
     return changed(stateDir, record.id, io);
@@ -410,14 +410,12 @@ export const actions = {
   },
 };
 
-export async function main(argv = process.argv.slice(2)) {
-  const [name, json] = argv;
+async function main() {
+  const argv = process.argv.slice(2), [name, json] = argv;
   if (argv.length !== 2 || !Object.hasOwn(actions, name)) throw new Error(`usage: control <${Object.keys(actions).join("|")}> 'JSON options'`);
   const options = JSON.parse(json);
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("options must be a JSON object");
-  const result = await actions[name](options);
-  console.log(JSON.stringify(result));
-  return result;
+  console.log(JSON.stringify(await actions[name](options)));
 }
 
 // Real paths, so a symlinked checkout still runs main.

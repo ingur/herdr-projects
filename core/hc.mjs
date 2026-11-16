@@ -19,11 +19,6 @@ export function hc(io, args) {
   return (io.command ?? command)("hc", args);
 }
 
-// hc 0.1.18 `ls` reports status as a word, 0.1.20 `get` as {app, state}.
-export function statusWord(status) {
-  return typeof status === "string" ? status : status?.state;
-}
-
 // projects.pid is `<agent pid>@<terminal pid>`. A terminal holds the session while that agent is alive
 // and the terminal still runs the program it ran then: one hc brought back after a restart has a new pid.
 export function holds(row, id) {
@@ -36,8 +31,8 @@ export function holds(row, id) {
 export function classify(rows, id) {
   const labelled = rows.filter(row => row.state === "live" && row.labels?.["projects.session"] === id);
   const agents = labelled.filter(row => holds(row, id));
-  const running = agents.find(row => statusWord(row.status));
-  if (running) return { state: "running", status: statusWord(running.status), terminal: running, labelled };
+  const running = agents.find(row => row.status?.state);
+  if (running) return { state: "running", status: running.status.state, terminal: running, labelled };
   if (agents.length) return { state: "starting", terminal: agents[0], labelled };
   return { state: "stopped", labelled };
 }

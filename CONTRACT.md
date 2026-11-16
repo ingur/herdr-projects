@@ -1,8 +1,8 @@
 # Projects contract
 
-hc runs terminals and types text in. `core/` keeps the records and decides who may send what to
-whom, with no agent-specific code. An adapter starts, resumes and deletes one tool's conversations.
-An integration inside each session binds it and gives the agent its tools.
+hc runs terminals and types text in. `core/` keeps the records and enforces the rules below, with
+no agent-specific code. An adapter starts, resumes and deletes one tool's conversations. An
+integration inside each session binds it, gives the agent its tools and keeps it inside its project.
 
 ## Records
 
@@ -16,7 +16,7 @@ version: 2
 id, role: "coordinator" | "thread"     id is core's own UUID, never the agent tool's
 coordinator                            its coordinator's id (its own for a coordinator)
 title, titleSource: "placeholder" | "agent" | "user"
-cwd, agent: "pi", resolved, rank, created
+cwd, agent, resolved, rank, created    agent is a key of core/adapters.mjs
 space?, tab?                           Herdr placement, taken from the terminal's labels
 reopenWithProject?: true               threads closed together with their project
 waiting: [{from, title?, id?, text, created}]   mail not yet typed in
@@ -48,7 +48,7 @@ TEXT
 From the user it is `<message from="user">`. `&`, `"`, `<`, `>` in attribute values are escaped.
 Text is 1 to 100000 characters. `send {to, from?, text}` (`from` absent means the user):
 
-1. A resolved thread is reopened when its coordinator or the user sends; others are refused.
+1. A resolved thread is unresolved when its coordinator or the user sends; others are refused.
 2. The message joins `waiting`, behind any older mail.
 3. `running`: waiting mail goes out now. `blocked` keeps it stored until the next delivery.
 4. `starting`: it stays stored and goes out at the session's `register`.
@@ -61,14 +61,14 @@ message was typed; when the recipient was `idle` or `done` and no turn started, 
 ## Actions
 
 `node core/control.mjs ACTION 'JSON'` (also `<stateDir>/bin/control`) prints one JSON object;
-errors print `projects: message` on stderr and exit 1. The same functions are `actions[name](options, io)` in `core/control.mjs`, next to `stateDirectory()`,
+errors print `projects: message` on stderr and exit 1. The same functions are `actions[name](options)` in `core/control.mjs`, next to `stateDirectory()`,
 `readRecord(stateDir, id)` and `findRecord(stateDir, predicate)`. `by` is `"user"` or `"agent"`.
 
 | Action | Options | Does |
 |---|---|---|
 | `list` | `{}` | `{sessions: [view], errors?}`: coordinators by rank, highest first, each followed by its threads, unresolved first, by rank |
-| `register` | `{id?, title?, cwd, agent, adapter, terminal, pid}` | Binds the conversation in an hc terminal; `pid` is the agent's own process. Without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another terminal holds the session. Labels the terminal, saves `adapter`, `cwd` and placement, clears what the session left elsewhere, reopens its unresolved threads that were open, delivers waiting mail |
-| `release` | `{id}` | The session leaves its terminal: a terminal core started keeps the session's labels and loses `projects.pid`, a terminal the user started loses every `projects.*` label; a coordinator's running threads are closed and flagged `reopenWithProject` |
+| `register` | `{id?, title?, cwd, agent, adapter, terminal, pid}` | Binds the conversation in an hc terminal; `pid` is the agent's own process. Without `id` creates a coordinator (`title` gives `user`, none gives `New project`, `placeholder`). Refused while another terminal holds the session. Labels the terminal, saves `adapter`, `cwd` and placement, clears what the session left elsewhere, launches its unresolved threads that were open, delivers waiting mail |
+| `release` | `{id}` | The session leaves its terminal: a terminal core started keeps the session's labels and loses `projects.pid`, a terminal the user started loses every `projects.*` label; a coordinator's open threads are closed and flagged `reopenWithProject` |
 | `create-thread` | `{coordinator, title?, cwd?, by, text?}` | New launched thread; `cwd` absolute or relative to the coordinator's. Titles unique per coordinator (ignoring case, also on rename), at most 80 characters, not `coordinator`; none gives `New thread`, `placeholder`. An existing title returns that thread with `existing: true` to an agent and sends nothing; the user is refused. `text` is the first message, from the coordinator |
 | `open` | `{id, space?}` | Launches when stopped; returns once the terminal exists |
 | `send` | `{to, from?, text}` | As above; adds `sent` and `note?` |
@@ -76,8 +76,8 @@ errors print `projects: message` on stderr and exit 1. The same functions are `a
 | `order` | `{id, rank}` | |
 | `place` | `{id, space}` | Only when stopped |
 | `resolve` | `{id, by, from?}` | An agent: only a thread, only from its coordinator, not while `working` (waits up to 20 s for a finishing turn). Then as `close` |
-| `reopen` | `{id}` | Clears `resolved` |
-| `close` | `{id}` | Kills the terminal carrying the label, read again right before the kill; a coordinator first closes its running threads and flags them `reopenWithProject` |
+| `unresolve` | `{id}` | Clears `resolved` |
+| `close` | `{id}` | Kills the terminal carrying the label, read again right before the kill; a coordinator first closes its open threads and flags them `reopenWithProject` |
 | `delete` | `{id}` | Closes, removes the conversation through the adapter and the record; a coordinator takes its threads. Prints `{deleted: [ids]}` |
 
 Every other action returns the view, with `error` when part of it failed:
@@ -91,8 +91,8 @@ status (hc's word, only when running), waiting (count), error?
 
 `hc run --bg --json --no-parent --cwd CWD [--label herdr.space=S --label herdr.tab=T] --label
 projects.session=ID --label projects.control=… --label projects.launched=1 -- env K=V …
-PROJECTS_SESSION=ID <adapter argv>`, then `projects.pid` from the pid hc reports (`env` execs the
-agent); an hc that reports no pid (before 0.1.20) fails the launch. A thread starts in its
+PROJECTS_SESSION=ID PROJECTS_STATE_DIR=DIR <adapter argv>`, then `projects.pid` from the pid hc
+reports (`env` execs the agent); no pid fails the launch. A thread starts in its
 coordinator's space while that runs, else in its recorded space, else unplaced. A failed `hc run`
 gives an `error`; mail stays.
 
@@ -100,15 +100,18 @@ Afterwards, and at every `register`, the terminals still labelled with the sessi
 it are read again. A terminal no longer live or labelled with this session is left alone. One core
 started that is an empty shell (no status, nothing of its own in the foreground) is killed; every
 other one loses its `projects.*` labels. A launch starts its new
-terminal before that, so the tab and its space stay alive. A thread is reopened with its project
+terminal before that, so the tab and its space stay alive. A thread is launched with its project
 when it is flagged `reopenWithProject` or left a terminal of core's behind: a reboot takes
-everything down at once, so the flag may never be written. `close`, `resolve` and `delete` do the same to what a stopped session left.
+everything down at once, so the flag may never be written. Stopping a session (`close`, `resolve`,
+`delete`, and a coordinator's `release` for its threads) also kills an empty shell core started
+for it, but leaves every other terminal as it is.
 
 - `projects.session=<id>`: the terminal running that session, and the one waiting for it while it is stopped.
 - `projects.launched=1`: core started this terminal; a terminal the user started never carries it.
 - `projects.pid=<agent pid>@<terminal pid>`: the agent process and the program hc ran in the terminal when it was bound (`pid` of `hc get`). A terminal hc brings back after a restart has another, so it never holds.
 - `projects.control={"version":2,"command":["<stateDir>/bin/control"],"stateDir":"…"}`.
 - `projects.changed=<ms>`: set after a change, on the session's terminal or its coordinator's.
+- `projects.rank=<n>`: owned by the sidebar, which orders terminals outside any session by it; core never sets or clears it.
 
 ## Adapters
 
@@ -119,11 +122,7 @@ the conversation). At launch `coordinator` is the coordinator's record as it is 
 coordinator's own) and `env` is called with it, so a thread starts the way its coordinator last
 registered. A new thread's `adapter` is `{}`.
 
-Pi keeps `{sessionId, sessionFile, command, env}`, `env` limited to `ENV` in `pi/adapter.mjs`.
-`resume` uses `--session FILE` once it exists, else `--session-id ID`; `start` adds `--name TITLE`;
-both run the coordinator's `command`, so a thread's own `command` and `env` are not used to launch
-it. `remove` deletes the transcript only when it is a regular file inside a Pi sessions directory
-whose header names `sessionId`.
+`pi/adapter.mjs` is the example.
 
 ## Inside a session
 
@@ -134,13 +133,16 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
   `error` (OSC 7501, hc's Program Status Protocol). hc never guesses it from the screen, and a
   session without a status stays `starting`, so its mail waits forever.
 - **Run in an hc terminal.** `$HC_TERMINAL_ID` is the `terminal` for `register`.
-- **Register at start.** A session launched by core finds its record id in `$PROJECTS_SESSION`.
+- **Register at start.** A session launched by core finds its record as `$PROJECTS_SESSION` in
+  `$PROJECTS_STATE_DIR`; a conversation the user starts or resumes finds it with `findRecord` on
+  its adapter data.
   Call `register {id, cwd, agent, adapter, terminal, pid}` with the agent's own pid and the
   adapter data that lets `resume` find this conversation again. Without `id` it creates a
   project from the current conversation. Do not block start-up on it: it returns once waiting
   mail is typed, which needs the agent running.
 - **Register again when the conversation is replaced** in the same terminal (a new or forked
-  conversation keeps the project), with the new adapter data.
+  conversation keeps the project), with the new adapter data. Switching to another saved
+  conversation leaves the project: `release`.
 - **Release on exit:** `release {id}`. A crash skips it; the pid check covers that.
 - **Tell the agent its role and what a message is.** A coordinator starts threads and carries
   on while they work; a thread sends its result to the coordinator when it is done (wording in
@@ -152,7 +154,7 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
   project only. Never `delete`. Core refuses a thread's `resolve` but not the rest, so the
   integration enforces this.
 - **Pass the user's own changes on:** a title the user sets is `rename` with `by: "user"`; input
-  the user submits in a resolved session is `reopen`. A title changed elsewhere shows in the
+  the user submits in a resolved session is `unresolve`. A title changed elsewhere shows in the
   session's record file.
 
 ## Known limits
@@ -165,6 +167,8 @@ calling `control` from its shell) must do the following; `pi/projects.ts` is the
 - A picker open in the agent swallows a message; when the agent was working this is silent.
 - A draft left untouched for 60 s stops holding messages (hc's `draft_wait`).
 - A tool that asks a startup question reports no status until it is answered; mail waits.
+- Delivery is at least once: if `hc send` fails after hc typed a message, it stays waiting and is
+  typed again.
 - A reboot (or an hc restart) brings a session's tab back as a shell: the session shows `stopped`
   until it is opened again, which starts it in that tab and closes the empty shell.
 - Requires hc 0.1.20 or newer.

@@ -29,7 +29,7 @@ Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://
 | `/projects new [name]` | turn this session into a project |
 | `/projects resume [name]` | open a stopped project in this terminal |
 
-The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`.
+The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`. A thread's agent gets only `thread_list`, `thread_send` and `thread_rename`.
 
 ## Good to know
 
@@ -41,6 +41,7 @@ The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `threa
 - Only you can delete.
 - State lives in `~/.local/state/herdr-projects`. Nothing is written into your repo.
 - State is per machine. Another machine has its own projects.
+- Sessions start with the Pi command the project last ran with. If upgrades move Pi (as on Nix), set `PROJECTS_PI_COMMAND` to a path that stays, or a JSON array of arguments.
 
 ## Update, remove (Pi)
 
@@ -62,4 +63,4 @@ node --test tests/*.test.mjs
 
 - Messages wait while you type, but a draft left alone for a minute no longer holds them.
 - A picker open in the agent swallows a message.
-- Threads get hc's environment plus Pi's own settings, not variables exported only in the coordinator's shell.
+- Threads get hc's environment plus the coordinator's `PATH` and Pi's own settings, not other variables exported only in the coordinator's shell.

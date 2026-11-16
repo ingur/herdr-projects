@@ -55,7 +55,7 @@ function hc() {
       if (verb === "ls") {
         const [key, value] = args[args.indexOf("--label") + 1].split(/=(.*)/s);
         return { terminals: rows.filter(row => row.state === "live" && row.labels[key] === value)
-          .map(row => ({ address: row.address, state: row.state, ...(row.status ? { status: row.status.state } : {}) })) };
+          .map(row => ({ address: row.address, state: row.state })) };
       }
       if (verb === "get") return structuredClone(await io.onGet?.(find(args[1])) ?? find(args[1]));
       if (verb === "label") {
@@ -156,10 +156,13 @@ test("a thread launches with its coordinator's current command", async t => {
   // The thread's own register stored the command it ran under, which has since moved.
   const sessionId = randomUUID(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker", reopenWithProject: true,
     adapter: { sessionId, command: ["/old/node", "/old/pi"], env: { PATH: "/old" } } });
-  const moved = { ...coordinator.adapter, command: [process.execPath, "pi"], env: { PATH: "/new" } };
+  // A record from before 0.1.3 still carries PROJECTS_STATE_DIR; core's own value is the one passed.
+  const moved = { ...coordinator.adapter, command: [process.execPath, "pi"], env: { PATH: "/new", PROJECTS_STATE_DIR: "/old/state" } };
   await actions.register({ ...f.options, id: coordinator.id, cwd: f.cwd, agent: "pi", adapter: moved, terminal: io.terminal({}).address, pid: process.pid }, io);
-  assert.deepEqual(io.rows.at(-1).argv, ["env", "PATH=/new", `PROJECTS_SESSION=${thread.id}`, process.execPath, "pi", "--session-id", sessionId]);
-  assert.match((await actions.open({ ...f.options, id: f.save({ adapter: { command: ["/gone/pi"] } }).id }, io)).error, /no longer at \/gone\/pi/);
+  assert.deepEqual(io.rows.at(-1).argv, ["env", "PATH=/new", `PROJECTS_SESSION=${thread.id}`, `PROJECTS_STATE_DIR=${f.stateDir}`, process.execPath, "pi", "--session-id", sessionId]);
+  const gone = await actions.open({ ...f.options, id: f.save({ adapter: { command: ["/gone/pi"] } }).id }, io);
+  assert.match(gone.error, /\/gone\/pi/);
+  assert.equal(verbs(io, "run").length, 1, "only the thread was started");
 });
 
 test("a terminal counts only while the agent process it names is alive", async t => {
@@ -173,7 +176,8 @@ test("a terminal counts only while the agent process it names is alive", async t
   const slow = io.terminal(f.bound(thread.id), null, 120_000);
   assert.equal((await actions.list(f.options, io)).sessions.find(view => view.id === thread.id).state, "starting");
   const waiting = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "work" }, io);
-  assert.deepEqual([waiting.state, waiting.sent, waiting.note], ["starting", false, "stored; it goes out when the session starts"]);
+  assert.deepEqual([waiting.state, waiting.sent], ["starting", false]);
+  assert.match(waiting.note, /starts/);
   assert.deepEqual(slow.typed, []);
   assert.equal(verbs(io, "run").length, 0);
 });
@@ -191,7 +195,7 @@ test("a stopped thread is launched under its live pid and gets its mail", async 
   assert.deepEqual(launched.typed, [wrap({ from: "coordinator", title: coordinator.title, id: coordinator.id, text: "work" })]);
 });
 
-test("reopening a session starts it in its tab, then closes the empty shell it left there", async t => {
+test("opening a stopped session starts it in its tab, then closes the empty shell it left there", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
   // What a reboot leaves: the terminals core started, back as shells, one of them busy, and one of the user's.
   const empty = io.terminal(f.left(thread.id), null), busy = io.terminal(f.left(thread.id), null), own = io.terminal(f.bound(thread.id, DEAD), null);
@@ -218,7 +222,19 @@ test("release keeps the terminal core started for the session and gives the user
   assert.deepEqual(user.labels, {}, "the user's own terminal is theirs again");
 });
 
-test("register reopens a thread that left a terminal of core's behind, with no flag to go by", async t => {
+test("stopping keeps the labels of a terminal core started that is not an empty shell", async t => {
+  const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
+  // The thread released itself, so projects.pid is gone, but its agent is still exiting and reports idle.
+  const exiting = io.terminal(f.left(thread.id), "idle");
+  await actions.close({ ...f.options, id: thread.id }, io);
+  assert.deepEqual([exiting.state, exiting.labels], ["live", f.left(thread.id)]);
+  io.terminal(f.bound(coordinator.id));
+  await actions.release({ ...f.options, id: coordinator.id }, io);
+  assert.deepEqual([exiting.state, exiting.labels], ["live", f.left(thread.id)], "the coordinator's release closes its threads the same way");
+  assert.equal(readRecord(f.stateDir, thread.id).reopenWithProject, true);
+});
+
+test("register launches a thread that left a terminal of core's behind, with no flag to go by", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
   const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
   const empty = io.terminal(f.left(thread.id), null);
@@ -272,6 +288,13 @@ test("double launch is refused", async t => {
   assert.equal(verbs(io, "run").length, 1);
 });
 
+test("a lock whose owner died is taken over", async t => {
+  const f = fixture(t), io = hc(), record = f.save();
+  mkdirSync(join(f.stateDir, "locks"));
+  writeFileSync(join(f.stateDir, "locks", record.id), String(DEAD));
+  assert.equal((await actions.order({ ...f.options, id: record.id, rank: 5 }, io)).rank, 5);
+});
+
 test("waiting mail is kept in order and handed over once", async t => {
   const f = fixture(t), io = hc(), coordinator = f.save({ adapter: { ...f.adapter, sessionId: randomUUID() } });
   const thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
@@ -295,7 +318,8 @@ test("a blocked session keeps the message and later mail does not overtake it", 
   const f = fixture(t), io = hc(), coordinator = f.save(), thread = f.save({ role: "thread", coordinator: coordinator.id, title: "Worker" });
   const row = io.terminal(f.bound(thread.id), "blocked");
   const held = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "first" }, io);
-  assert.deepEqual([held.sent, held.note, held.waiting], [false, "stored; the session is waiting on the user", 1]);
+  assert.deepEqual([held.sent, held.status, held.waiting], [false, "blocked", 1]);
+  assert.match(held.note, /user/);
   assert.deepEqual(row.typed, []);
   row.status = { app: "pi", state: "idle" };
   const later = await actions.send({ ...f.options, to: thread.id, from: coordinator.id, text: "second" }, io);

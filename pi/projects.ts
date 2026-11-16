@@ -30,12 +30,11 @@ function piCommand() {
   return command;
 }
 
-function adapter(ctx: ExtensionContext, stateDir: string) {
+function adapter(ctx: ExtensionContext) {
   const env: Record<string, string> = {};
   for (const name of ENV) {
     if (process.env[name] !== undefined) env[name] = process.env[name];
   }
-  env.PROJECTS_STATE_DIR = stateDir;
   return { sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(), command: piCommand(), env };
 }
 
@@ -101,7 +100,7 @@ export default function projects(pi: ExtensionAPI) {
     const stateDir = stateDirectory();
     if (bound || piRecord(stateDir, "sessionId", ctx.sessionManager.getSessionId())) throw new Error("This conversation is already in a project.");
     if (!ctx.sessionManager.getSessionFile()) throw new Error("Projects needs a saved Pi session; do not use --no-session.");
-    const view = await actions.register({ ...(id ? { id } : { title: name || pi.getSessionName() }), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx, stateDir), terminal: process.env.HC_TERMINAL_ID, pid: process.pid });
+    const view = await actions.register({ ...(id ? { id } : { title: name || pi.getSessionName() }), cwd: ctx.cwd, agent: "pi", adapter: adapter(ctx), terminal: process.env.HC_TERMINAL_ID, pid: process.pid });
     bind(stateDir, view);
     ctx.ui.notify(`Project ${view.title} uses this conversation.`, "info");
     if (view.error) ctx.ui.notify(`Projects: ${view.error}`, "error");
@@ -112,7 +111,7 @@ export default function projects(pi: ExtensionAPI) {
     const stateDir = ctx.mode === "tui" && terminal ? stateDirectory() : undefined;
     const record = stateDir && ownRecord(event, ctx, stateDir);
     if (!record) return applyTools();
-    const data = adapter(ctx, stateDir);
+    const data = adapter(ctx);
     bind(stateDir, record);
     const binding = bound;
     // register returns once waiting mail is typed, which needs this Pi running, so do not wait for it.
@@ -151,7 +150,7 @@ export default function projects(pi: ExtensionAPI) {
   pi.on("input", async (event, ctx) => {
     const b = bound;
     if (!b || event.source !== "interactive" || !readRecord(b.stateDir, b.id)?.resolved) return;
-    try { await actions.reopen({ id: b.id }); }
+    try { await actions.unresolve({ id: b.id }); }
     catch (error) { ctx.ui.notify(`Projects: ${message(error)}`, "error"); }
   });
 
