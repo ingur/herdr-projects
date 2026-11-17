@@ -1,0 +1,5 @@
+{
+  "name": "herdr-projects",
+  "owner": { "name": "ingur" },
+  "plugins": [{ "name": "projects", "source": "./", "description": "Long-running projects for coding agents in herdr terminals" }]
+}

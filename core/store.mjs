@@ -20,7 +20,7 @@ export function readRecord(stateDir, id) {
   let record;
   try { record = JSON.parse(readFileSync(recordPath(stateDir, id), "utf8")); }
   catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
-  if (record?.version !== 2 || record.id !== id) throw new Error(`Session record ${id} is not a version 2 record`);
+  if (record?.version !== 3 || record.id !== id) throw new Error(`Session record ${id} is not a version 3 record`);
   return record;
 }
 
@@ -64,6 +64,17 @@ export function writeExecutable(path, content) {
 
 export function removeRecord(stateDir, id) {
   rmSync(recordPath(stateDir, id), { force: true });
+}
+
+const toolPath = (stateDir, agent) => join(stateDir, "tools", `${agent}.json`);
+
+export function readTool(stateDir, agent) {
+  try { return JSON.parse(readFileSync(toolPath(stateDir, agent), "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return { env: {} }; throw error; }
+}
+
+export function writeTool(stateDir, agent, tool) {
+  atomicWrite(toolPath(stateDir, agent), JSON.stringify(tool, null, 2) + "\n", 0o600);
 }
 
 // The user's mail: one file per message. Its name is the key and sorts by time, so no lock is needed.

@@ -1,22 +1,26 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { adapter } from "./adapters.mjs";
-import { classify, details, hc, holds, observe } from "./hc.mjs";
-import { collectMail, findRecord, locked, readRecord, readRecords, removeRecord, rewrite, stateDirectory, update, writeExecutable, writeMail, writeRecord } from "./store.mjs";
-
-export { findRecord, readRecord, stateDirectory };
+import adapters from "../adapters.mjs";
+import { agentPid, classify, details, entered, hc, holds, observe, standIn } from "./hc.mjs";
+import { tools } from "./roles.mjs";
+import {
+  collectMail, locked, readRecord, readRecords, readTool, removeRecord, rewrite, stateDirectory, update,
+  writeExecutable, writeMail, writeRecord, writeTool,
+} from "./store.mjs";
 
 const STORED = {
   starting: "stored; it goes out when the session starts",
   blocked: "stored; the session is waiting on the user",
   coordinator: "stored; it goes out when the user resumes the project",
-  user: "stored for the user",
+  user: "stored for the user, who gets it from their client",
+  existing: "A thread with this title already exists, so nothing was sent to it",
 };
-const UNLABEL = ["projects.session=", "projects.pid=", "projects.control=", "projects.changed=", "projects.launched="];
+const UNLABEL = ["projects.session=", "projects.pid=", "projects.bound=", "projects.control=", "projects.changed=", "projects.launched="];
 const errorText = error => error instanceof Error ? error.message : String(error);
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const descriptor = stateDir => JSON.stringify({ version: 2, command: [join(stateDir, "bin", "control")], stateDir });
@@ -28,6 +32,26 @@ function session(stateDir, id) {
   if (!record) throw new Error(`No session ${id}`);
   return record;
 }
+function adapter(io, agent) {
+  const known = io.adapters ?? adapters;
+  if (!Object.hasOwn(known, agent)) throw new Error(`No adapter for agent ${JSON.stringify(agent)}`);
+  return known[agent];
+}
+
+function actor(stateDir, as) {
+  return as === undefined ? undefined : session(stateDir, as);
+}
+
+function target(stateDir, me, value) {
+  if (!me) return session(stateDir, value);
+  const project = [session(stateDir, me.coordinator), ...threads(stateDir, me.coordinator)];
+  const found = value === "coordinator" ? project[0]
+    : project.find(record => record.id === value)
+      ?? project.find(record => record.role === "thread" && record.title.toLowerCase() === String(value).toLowerCase());
+  if (!found) throw new Error(`No session ${JSON.stringify(value)} in this project`);
+  return found;
+}
+
 function threads(stateDir, coordinator) {
   return readRecords(stateDir).records.filter(record => record.role === "thread" && record.coordinator === coordinator);
 }
@@ -37,8 +61,10 @@ function title(value, role) {
   if (role === "thread" && ["coordinator", "user"].includes(trimmed.toLowerCase())) throw new Error(`A thread cannot be called ${trimmed.toLowerCase()}`);
   return trimmed;
 }
-function author(value) {
-  if (value !== "user" && value !== "agent") throw new Error('by must be "user" or "agent"');
+function conversation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.id !== "string" || !value.id) {
+    throw new Error("conversation must be an object with the tool's own id");
+  }
   return value;
 }
 function messageText(value) {
@@ -99,12 +125,11 @@ async function running(io, id, seconds) {
   }
 }
 
-// Right before typing, the terminal must still hold the session (label and live agent pid) and report a status.
 async function type(io, id, address, message) {
   const row = await hc(io, ["get", address, "--json"]);
   const status = row.status?.state;
   if (!holds(row, id)) return { held: "stopped" };
-  if (!status) return { held: "starting" };
+  if (!entered(row, id) || !status) return { held: "starting" };
   if (status === "blocked") return { held: "blocked" };
   const result = await hc(io, ["send", "--json", address, message]);
   return result.started === false && (status === "idle" || status === "done") ? { note: "typed, but no turn started" } : {};
@@ -129,16 +154,14 @@ async function deliver(stateDir, id, io, seconds = 0) {
   } catch (error) { return { error: errorText(error) }; }
 }
 
-// What a session left behind: terminals that carry its label without holding it. One core started
-// and that is an empty shell again (no status, nothing of its own in the foreground, read again
-// right before) waits for nothing and is closed; any other loses the labels, unless the session only stops.
+// What a session left behind: terminals that carry its label without holding it. An empty shell hc
+// put in place of the program that ran there is closed; any other loses the labels, unless the session only stops.
 async function vacate(io, rows, id, address, unlabel = true) {
   for (const row of rows) {
     if (row.address === address) continue;
     const current = await hc(io, ["get", row.address, "--json"]);
     if (current.state !== "live" || current.labels?.["projects.session"] !== id) continue;
-    if (current.labels["projects.launched"] && !current.status?.state
-      && current.foreground?.pid === current.pid) await hc(io, ["kill", row.address, "--json"]);
+    if (standIn(current)) await hc(io, ["kill", row.address, "--json"]);
     else if (unlabel) await hc(io, ["label", row.address, "--json", ...UNLABEL]);
   }
 }
@@ -151,14 +174,15 @@ async function launch(stateDir, id, io, place) {
       let target = place ?? record.space;
       if (place === undefined && record.role === "thread") target = (await observe(io, record.coordinator)).terminal?.labels["herdr.space"] ?? target;
       const tab = target === undefined ? undefined : record.tab ?? `pt-${id}`;
-      // A thread starts the way its coordinator last registered, so it follows an upgrade of the agent.
-      const module = await adapter(record.agent), coordinator = session(stateDir, record.coordinator);
-      const argv = module.resume(record, coordinator) ?? module.start(record, coordinator);
-      const env = Object.entries(module.env(coordinator)).map(([key, value]) => `${key}=${value}`);
+      const module = adapter(io, record.agent), tool = readTool(stateDir, record.agent);
+      const argv = (record.conversation && module.resume(record.conversation, tool)) ?? module.start(record, tool);
+      const env = Object.entries(tool.env).map(([key, value]) => `${key}=${value}`);
+      const found = await hc(io, ["exec", "--json", ...env.flatMap(pair => ["--env", pair]), "--", "sh", "-c", 'command -v "$1"', "sh", argv[0]]);
+      if (found.code !== 0) throw new Error(`${argv[0]} was not found on the PATH herdr starts it with`);
       const { address } = await hc(io, ["run", "--bg", "--json", "--no-parent", "--cwd", record.cwd,
         ...(target === undefined ? [] : ["--label", `herdr.space=${target}`, "--label", `herdr.tab=${tab}`]),
         "--label", `projects.session=${id}`, "--label", `projects.control=${descriptor(stateDir)}`, "--label", "projects.launched=1",
-        "--", "env", ...env, `PROJECTS_SESSION=${id}`, `PROJECTS_STATE_DIR=${stateDir}`, ...argv]);
+        "--", "env", ...env, `PROJECTS_STATE_DIR=${stateDir}`, ...argv]);
       // With `env … agent`, env execs the agent, so the program pid hc reports is the agent's.
       const { pid } = await hc(io, ["get", address, "--json"]);
       if (!pid) throw new Error("hc reported no pid for the new terminal");
@@ -208,6 +232,62 @@ function writeShim(stateDir) {
   writeExecutable(join(stateDir, "bin", "control"), `#!/bin/sh\nnode=${quote(process.execPath)}\n[ -x "$node" ] || node=node\nexec "$node" ${quote(fileURLToPath(import.meta.url))} "$@"\n`);
 }
 
+function follow(stateDir, id) {
+  spawn(join(stateDir, "bin", "control"), ["settle", JSON.stringify({ id, stateDir })], { detached: true, stdio: "ignore" }).unref();
+}
+
+function inConversation(stateDir, agent, talk) {
+  return readRecords(stateDir).records.find(record => record.agent === agent && record.conversation?.id === talk.id);
+}
+
+async function arrival(options, io) {
+  const stateDir = stateDirectory(options.stateDir);
+  adapter(io, options.agent);
+  if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name an hc terminal");
+  if (!Number.isInteger(options.pid) || options.pid <= 0) throw new Error("pid must be the agent's process id");
+  const talk = conversation(options.conversation);
+  const read = () => hc(io, ["get", options.terminal, "--json"]);
+  const seen = await read();
+  const starting = readRecord(stateDir, seen.labels?.["projects.session"]);
+  const row = starting ? await locked(stateDir, starting.id, read, io) : seen;
+  if (row.state !== "live") throw new Error(`Terminal ${row.address} is not live`);
+  const id = row.labels?.["projects.session"], here = holds(row, id) ? readRecord(stateDir, id) : undefined;
+  const taken = row.labels?.["projects.bound"] === "1";
+  return {
+    stateDir, row, talk,
+    started: taken ? undefined : here,
+    kept: taken && agentPid(row) === options.pid ? here : undefined,
+  };
+}
+
+async function bind(stateDir, id, row, options, talk, io) {
+  await locked(stateDir, id, async () => {
+    const observed = await observe(io, id);
+    const other = observed.labelled.find(live => live.address !== row.address && holds(live, id));
+    if (other) throw new Error(`This session is already open in terminal ${other.address}`);
+    await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}@${row.pid}`,
+      "projects.bound=1", `projects.control=${descriptor(stateDir)}`]);
+    await vacate(io, observed.labelled, id, row.address);
+    rewrite(stateDir, id, record => ({
+      agent: options.agent, conversation: talk, reopenWithProject: undefined,
+      space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab,
+    }));
+  }, io);
+  const env = options.env ?? {};
+  writeTool(stateDir, options.agent, {
+    env: Object.fromEntries(adapter(io, options.agent).variables.filter(key => typeof env[key] === "string").map(key => [key, env[key]])),
+  });
+  writeShim(stateDir);
+  (io.follow ?? follow)(stateDir, id);
+  return changed(stateDir, id, io);
+}
+
+async function release(stateDir, record, row, io, labels) {
+  await remember(stateDir, record.id, row, io);
+  await hc(io, ["label", row.address, "--json", ...labels]);
+  if (record.role === "coordinator") await closeThreads(stateDir, record.id, io, await snapshot(io, stateDir, record));
+}
+
 export const actions = {
   async list(options = {}, io = {}) {
     const stateDir = stateDirectory(options.stateDir);
@@ -221,73 +301,83 @@ export const actions = {
     const ranks = new Map(sessions.filter(view => view.role === "coordinator").map(view => [view.id, view.rank]));
     sessions.sort((a, b) => (ranks.get(b.coordinator) ?? 0) - (ranks.get(a.coordinator) ?? 0) || a.coordinator.localeCompare(b.coordinator) ||
       Number(a.role === "thread") - Number(b.role === "thread") || Number(a.resolved) - Number(b.resolved) || b.rank - a.rank || a.id.localeCompare(b.id));
+    const me = actor(stateDir, options.as);
+    if (me) return { you: me.id, sessions: sessions.filter(view => view.coordinator === me.coordinator) };
     return { sessions, ...(errors.length ? { errors } : {}) };
   },
 
-  async register(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir);
-    await adapter(options.agent);
+  async enter(options, io = {}) {
+    const { stateDir, row, talk, started, kept } = await arrival(options, io);
+    const same = kept && (options.replaced || kept.conversation?.id === talk.id);
+    const next = started ?? (same ? kept : inConversation(stateDir, options.agent, talk));
+    if (kept && kept.id !== next?.id) await release(stateDir, kept, row, io, UNLABEL);
+    if (!next) return {};
+    return { session: await bind(stateDir, next.id, row, options, talk, io) };
+  },
+
+  async create(options, io = {}) {
+    const { stateDir, row, talk, started, kept } = await arrival(options, io);
     if (typeof options.cwd !== "string" || !isAbsolute(options.cwd)) throw new Error("cwd must be an absolute path");
-    if (!options.adapter || typeof options.adapter !== "object" || Array.isArray(options.adapter)) throw new Error("adapter must be an object");
-    if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name an hc terminal");
-    if (!Number.isInteger(options.pid) || options.pid <= 0) throw new Error("pid must be the agent's process id");
-    const promoted = options.id === undefined, id = promoted ? randomUUID() : session(stateDir, options.id).id;
-    if (promoted) {
-      const created = new Date();
-      writeRecord(stateDir, { version: 2, id, role: "coordinator", coordinator: id,
-        title: options.title === undefined ? "New project" : title(options.title, "coordinator"),
-        titleSource: options.title === undefined ? "placeholder" : "user",
-        cwd: options.cwd, agent: options.agent, resolved: false, rank: created.getTime(), created: created.toISOString(), waiting: [], adapter: options.adapter });
-    }
+    if (started || kept || inConversation(stateDir, options.agent, talk)) throw new Error("This conversation is already in a project");
+    const id = randomUUID(), created = new Date();
+    writeRecord(stateDir, {
+      version: 3, id, role: "coordinator", coordinator: id,
+      title: options.title === undefined ? "New project" : title(options.title, "coordinator"),
+      titleSource: options.title === undefined ? "placeholder" : "user",
+      cwd: options.cwd, agent: options.agent, resolved: false, rank: created.getTime(), created: created.toISOString(), waiting: [],
+    });
     try {
-      await locked(stateDir, id, async () => {
-        const row = await hc(io, ["get", options.terminal, "--json"]);
-        if (row.state !== "live") throw new Error(`Terminal ${row.address} is not live`);
-        const observed = await observe(io, id);
-        const other = observed.labelled.find(live => live.address !== row.address && holds(live, id));
-        if (other) throw new Error(`This session is already open in terminal ${other.address}`);
-        await hc(io, ["label", row.address, "--json", `projects.session=${id}`, `projects.pid=${options.pid}@${row.pid}`, `projects.control=${descriptor(stateDir)}`]);
-        // Only a launch sets `projects.launched`; what the session left elsewhere goes.
-        await vacate(io, observed.labelled, id, row.address);
-        rewrite(stateDir, id, record => ({ cwd: options.cwd, agent: options.agent, adapter: options.adapter, reopenWithProject: undefined,
-          space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }));
-      }, io);
+      return { session: await bind(stateDir, id, row, options, talk, io) };
     } catch (error) {
-      if (promoted) removeRecord(stateDir, id);
+      removeRecord(stateDir, id);
       throw error;
     }
-    writeShim(stateDir);
-    const errors = [], children = threads(stateDir, id);
-    // A reboot takes the whole project down at once, so `reopenWithProject` may never be written;
-    // a thread that left a terminal of core's behind was open too.
-    const rows = children.length ? await snapshot(io, stateDir, session(stateDir, id)) : [];
+  },
+
+  async leave(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), row = await hc(io, ["get", options.terminal, "--json"]);
+    const held = agentPid(row) === options.pid ? readRecord(stateDir, row.labels?.["projects.session"]) : undefined;
+    if (!held) return {};
+    await release(stateDir, held, row, io, ["projects.bound=", `projects.pid=@${row.pid}`]);
+    return { session: await changed(stateDir, held.id, io) };
+  },
+
+  async session(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), row = await hc(io, ["get", options.terminal, "--json"]);
+    const id = row.labels?.["projects.session"];
+    const held = agentPid(row) === options.pid && entered(row, id) ? readRecord(stateDir, id) : undefined;
+    return held ? { session: view(held, classify([row], id)) } : {};
+  },
+
+  async act(options, io = {}) {
+    const tool = tools.find(tool => tool.name === options.tool);
+    if (!tool) throw new Error(`No tool ${JSON.stringify(options.tool)}`);
+    if (typeof options.as !== "string") throw new Error("This conversation is not in a project");
+    return actions[tool.action]({ stateDir: options.stateDir, as: options.as, ...tool.options(options.args ?? {}) }, io);
+  },
+
+  async settle(options, io = {}) {
+    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
+    const errors = [], children = record.role === "coordinator" ? threads(stateDir, record.id) : [];
+    const rows = children.length ? await snapshot(io, stateDir, record) : [];
     await Promise.all(children.filter(thread => thread.reopenWithProject || isOpen(rows, thread.id)).map(async thread => {
       await update(stateDir, thread.id, () => ({ reopenWithProject: undefined }), io);
       if (thread.resolved) return;
       const { error } = await launch(stateDir, thread.id, io);
       if (error) errors.push(`${thread.title}: ${error}`);
     }));
-    const { error } = await deliver(stateDir, id, io, 60);
+    const { error } = await deliver(stateDir, record.id, io, 60);
     if (error) errors.push(error);
-    return changed(stateDir, id, io, errors.length ? { error: errors.join("; ") } : {});
-  },
-
-  async release(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), rows = await snapshot(io, stateDir, record);
-    // A terminal core started keeps the session's labels: it waits for the session. The user's own is theirs again.
-    for (const row of classify(rows, record.id).labelled) {
-      await remember(stateDir, record.id, row, io);
-      await hc(io, ["label", row.address, "--json", ...(row.labels["projects.launched"] ? ["projects.pid="] : UNLABEL)]);
-    }
-    if (record.role === "coordinator") await closeThreads(stateDir, record.id, io, rows);
-    return changed(stateDir, record.id, io);
+    return changed(stateDir, record.id, io, errors.length ? { error: errors.join("; ") } : {});
   },
 
   async "create-thread"(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), coordinator = session(stateDir, options.coordinator);
+    const stateDir = stateDirectory(options.stateDir), me = actor(stateDir, options.as);
+    const coordinator = me ?? session(stateDir, options.coordinator);
     if (coordinator.role !== "coordinator") throw new Error("Threads are created under a coordinator");
-    const by = author(options.by), wanted = options.title === undefined ? undefined : title(options.title, "thread");
-    const text = options.text === undefined ? undefined : messageText(options.text);
+    const by = me ? "agent" : "user", wanted = options.title === undefined ? undefined : title(options.title, "thread");
+    const text = options.text === undefined ? undefined : messageText(options.text), agent = options.agent ?? coordinator.agent;
+    adapter(io, agent);
     if (options.cwd !== undefined && typeof options.cwd !== "string") throw new Error("cwd must be a path");
     const cwd = resolve(coordinator.cwd, options.cwd ?? ".");
     if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} is not a directory`);
@@ -299,17 +389,14 @@ export const actions = {
       let name = wanted ?? "New thread";
       for (let number = 2; taken.has(name.toLowerCase()); number++) name = `New thread ${number}`;
       const created = new Date();
-      return { record: writeRecord(stateDir, { version: 2, id: randomUUID(), role: "thread", coordinator: coordinator.id, title: name,
-        titleSource: wanted === undefined ? "placeholder" : by, cwd, agent: coordinator.agent, resolved: false,
+      return { record: writeRecord(stateDir, { version: 3, id: randomUUID(), role: "thread", coordinator: coordinator.id, title: name,
+        titleSource: wanted === undefined ? "placeholder" : by, cwd, agent, resolved: false,
         rank: created.getTime(), created: created.toISOString(),
-        waiting: text === undefined ? [] : [{ from: "coordinator", title: coordinator.title, id: coordinator.id, text, created: created.toISOString() }],
-        adapter: {} }) };
+        waiting: text === undefined ? [] : [{ from: "coordinator", title: coordinator.title, id: coordinator.id, text, created: created.toISOString() }] }) };
     }, io);
-    if (existing) return changed(stateDir, existing.id, io, { existing: true });
+    if (existing) return changed(stateDir, existing.id, io, { existing: true, note: STORED.existing });
     const launched = await launch(stateDir, record.id, io);
-    if (launched.error) return changed(stateDir, record.id, io, launched);
-    const { error } = await deliver(stateDir, record.id, io, 60);
-    return changed(stateDir, record.id, io, error ? { error } : {});
+    return changed(stateDir, record.id, io, launched.error || text === undefined ? launched : { note: STORED.starting });
   },
 
   async open(options, io = {}) {
@@ -321,15 +408,14 @@ export const actions = {
   },
 
   async send(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir);
+    const stateDir = stateDirectory(options.stateDir), sender = actor(stateDir, options.as), text = messageText(options.text);
     if (options.to === "user") {
-      if (options.from === undefined) throw new Error("A message to the user comes from a session");
-      const sender = session(stateDir, options.from);
-      writeMail(stateDir, { from: sender.role, title: sender.title, id: sender.id, text: messageText(options.text), created: new Date().toISOString() });
+      if (!sender) throw new Error("A message to the user comes from a session");
+      writeMail(stateDir, { from: sender.role, title: sender.title, id: sender.id, text, created: new Date().toISOString() });
       return changed(stateDir, sender.id, io, { sent: false, note: STORED.user });
     }
-    const recipient = session(stateDir, options.to);
-    const sender = options.from === undefined ? undefined : session(stateDir, options.from), text = messageText(options.text);
+    const recipient = target(stateDir, sender, options.to);
+    if (recipient.id === sender?.id) throw new Error("Send to another session, not yourself");
     if (recipient.role === "thread" && recipient.resolved) {
       if (sender && sender.id !== recipient.coordinator) throw new Error("This thread is resolved; only its coordinator or the user can reopen it");
       await update(stateDir, recipient.id, () => ({ resolved: false }), io);
@@ -341,7 +427,7 @@ export const actions = {
     if (observed.state === "running") result = await deliver(stateDir, recipient.id, io);
     else if (observed.state === "stopped" && recipient.role === "thread") {
       const launched = await launch(stateDir, recipient.id, io);
-      result = launched.error ? { ...launched, held: "stopped" } : await deliver(stateDir, recipient.id, io, 60);
+      result = launched.error ? { ...launched, held: "stopped" } : { held: "starting" };
     }
     const sent = !session(stateDir, recipient.id).waiting.some(entry => JSON.stringify(entry) === JSON.stringify(message));
     const note = sent ? result.note : result.held === "blocked" ? STORED.blocked
@@ -354,8 +440,10 @@ export const actions = {
   },
 
   async rename(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
-    const by = author(options.by), name = title(options.title, record.role);
+    const stateDir = stateDirectory(options.stateDir), me = actor(stateDir, options.as);
+    const record = me && options.id === undefined ? me : target(stateDir, me, options.id);
+    if (me?.role === "thread" && record.id !== me.id) throw new Error("A thread renames only itself");
+    const by = me ? "agent" : "user", name = title(options.title, record.role);
     const change = current => {
       if (by === "agent" && current.titleSource === "user") throw new Error("The user chose this title; an agent cannot change it");
       if (current.role === "thread" && threads(stateDir, current.coordinator).some(thread => thread.id !== current.id && thread.title.toLowerCase() === name.toLowerCase())) {
@@ -383,9 +471,9 @@ export const actions = {
   },
 
   async resolve(options, io = {}) {
-    const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id);
-    if (author(options.by) === "agent") {
-      if (record.role !== "thread" || options.from !== record.coordinator) throw new Error("Only a thread's coordinator can resolve it");
+    const stateDir = stateDirectory(options.stateDir), me = actor(stateDir, options.as), record = target(stateDir, me, options.id);
+    if (me) {
+      if (me.role !== "coordinator" || record.role !== "thread") throw new Error("Only a thread's coordinator can resolve it");
       // A thread usually reports just before its turn ends; give that turn a moment to finish.
       for (let second = 0; (await observe(io, record.id)).status === "working"; second++) {
         if (second >= 20) throw new Error("This thread is still working; wait for its result, then resolve it");
@@ -413,7 +501,8 @@ export const actions = {
     const stateDir = stateDirectory(options.stateDir), record = session(stateDir, options.id), rows = await snapshot(io, stateDir, record);
     const remove = async target => {
       await stop(stateDir, target.id, io, rows, true);
-      (await adapter(target.agent)).remove(session(stateDir, target.id));
+      const { agent, conversation } = session(stateDir, target.id);
+      if (conversation) adapter(io, agent).remove(conversation, readTool(stateDir, agent));
       removeRecord(stateDir, target.id);
       return target.id;
     };
@@ -424,8 +513,8 @@ export const actions = {
 };
 
 async function main() {
-  const argv = process.argv.slice(2), [name, json] = argv;
-  if (argv.length !== 2 || !Object.hasOwn(actions, name)) throw new Error(`usage: control <${Object.keys(actions).join("|")}> 'JSON options'`);
+  const argv = process.argv.slice(2), [name, json = readFileSync(0, "utf8")] = argv;
+  if (!Object.hasOwn(actions, name)) throw new Error(`usage: control <${Object.keys(actions).join("|")}> ['JSON options', else on stdin]`);
   const options = JSON.parse(json);
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("options must be a JSON object");
   console.log(JSON.stringify(await actions[name](options)));

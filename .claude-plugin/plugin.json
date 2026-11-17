@@ -1,0 +1,22 @@
+{
+  "name": "projects",
+  "description": "Long-running projects for coding agents in herdr terminals",
+  "repository": "https://github.com/ingur/herdr-projects",
+  "license": "MIT",
+  "commands": {
+    "new": {
+      "content": "This conversation is now a project, and you are its coordinator. Confirm that in one sentence and wait for the user.",
+      "description": "Make this conversation a project",
+      "argumentHint": "[name]"
+    }
+  },
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/claude/hooks.mjs"] }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/claude/hooks.mjs"] }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/claude/hooks.mjs"] }] }],
+    "UserPromptExpansion": [{ "matcher": "projects:new", "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/claude/hooks.mjs"] }] }]
+  },
+  "mcpServers": {
+    "projects": { "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/claude/tools.mjs"] }
+  }
+}

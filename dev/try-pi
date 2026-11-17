@@ -2,5 +2,6 @@
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 export PI_CODING_AGENT_DIR="$repo/.state/pi"
-export PROJECTS_STATE_DIR="$repo/.state/herdr-projects"
-exec pi -e "$repo" "$@"
+export PROJECTS_STATE_DIR="${PROJECTS_STATE_DIR:-$repo/.state/herdr-projects}"
+pi install "$repo" >/dev/null
+exec pi "$@"

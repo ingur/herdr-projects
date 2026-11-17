@@ -1,42 +1,32 @@
 #!/bin/sh
-# By hand after an hc or Pi update: two Pi sessions on an isolated hc core, registered through
-# control, exchange one message each way. Needs pi, jq and hc 0.1.20+ (HC_DIR when `hc` is older).
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-have=$(hc --version | cut -d' ' -f2)
-if [ "$(printf '%s\n' 0.1.20 "$have" | sort -V | head -n 1)" != 0.1.20 ]; then
-  PATH="${HC_DIR:?hc $have is older than 0.1.20; set HC_DIR to a newer hc bin directory}:$PATH"
-fi
-unset HC_TERMINAL_ID HC_TERMINAL_SOCKET
-export HC_SESSION=pp-smoke PI_CODING_AGENT_DIR="$repo/.state/pi"
-work=$(cd "$(mktemp -d)" && pwd -P)
-export PROJECTS_STATE_DIR="$work/state"
-transcripts="$PI_CODING_AGENT_DIR/sessions/--$(printf %s "${work#/}" | tr / -)--"
-trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$work" "$transcripts"' EXIT
+agent=${1:?usage: dev/smoke pi|omp|claude  (log in once with dev/try-AGENT first)}
+case $agent in claude) new="/projects:new Smoke" ;; *) new="/projects new Smoke" ;; esac
 
-adapter=$(jq -nc --arg dir "$PI_CODING_AGENT_DIR" --arg path "$PATH" '{command: ["pi", "--no-extensions"], env: {PI_CODING_AGENT_DIR: $dir, PATH: $path}}')
-control() { node "$repo/core/control.mjs" "$@"; }
-fail() { echo "smoke: $*" >&2; exit 1; }
-# The terminal runs `env … pi`, which execs Pi, so hc's program pid is Pi's.
-register() {
-  pid=$(hc get "$1" --json | jq .pid)
-  control register "$(jq -nc --arg cwd "$work" --arg t "$1" --argjson pid "$pid" --argjson a "$adapter" "{cwd: \$cwd, agent: \"pi\", terminal: \$t, pid: \$pid, adapter: \$a} + $2")"
-}
-send() { control send "$(jq -nc --arg to "$1" --arg from "$2" '{to: $to, from: $from, text: "Reply with the single word ok. Do not use tools."}')"; }
-turned() {
-  hc wait --timeout 180 "$1" >/dev/null
-  [ "$(hc get "$1" --json | jq .turn)" -gt 0 ] || fail "no turn in $1"
+unset HC_TERMINAL_ID HC_TERMINAL_SOCKET HC_SCOPE
+export HC_SESSION=projects-smoke
+state="$repo/.state/herdr-projects-smoke"
+trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$state" "${XDG_STATE_HOME:-$HOME/.local/state}/herdr-core/projects-smoke"' EXIT
+
+control() { PROJECTS_STATE_DIR="$state" node "$repo/core/control.mjs" "$@"; }
+field() { control list '{}' | jq -r --arg title "$1" --arg field "$2" '.sessions[] | select(.title == $title) | .[$field]'; }
+expect() {
+  for _ in $(seq 60); do [ "$(field "$1" "$2")" = "$3" ] && return; sleep 1; done
+  echo "smoke: $1 never had $2 = $3" >&2; exit 1
 }
 
-t1=$(hc run --bg --json --no-parent --cwd "$work" -- env PATH="$PATH" PI_CODING_AGENT_DIR="$PI_CODING_AGENT_DIR" pi --no-extensions | jq -r .address)
-coordinator=$(register "$t1" '{title: "Smoke"}' | jq -r .id)
-thread=$(control create-thread "$(jq -nc --arg c "$coordinator" '{coordinator: $c, title: "helper", by: "user"}')")
-t2=$(printf '%s\n' "$thread" | jq -r .terminal)
-thread=$(printf '%s\n' "$thread" | jq -r .id)
-# Typed at once if the thread is up, else stored until its register.
-send "$thread" "$coordinator" >/dev/null
-register "$t2" "$(jq -nc --arg id "$thread" '{id: $id}')" | jq -e '.waiting == 0' >/dev/null || fail "mail to the thread is still waiting"
-turned "$t2"
-send "$coordinator" "$thread" | jq -e .sent >/dev/null || fail "not sent to the coordinator"
-turned "$t1"
-echo "smoke: ok"
+terminal=$(hc run --bg --json --no-parent --cwd "$repo" -- env PROJECTS_STATE_DIR="$state" "$repo/dev/try-$agent" | jq -r .address)
+hc wait --timeout 60 "$terminal" >/dev/null
+hc send "$terminal" "$new" >/dev/null
+expect Smoke state running
+
+control create-thread "$(jq -nc --arg id "$(field Smoke id)" '{coordinator: $id, title: "Helper"}')" >/dev/null
+expect Helper state running
+
+control send "$(jq -nc --arg id "$(field Helper id)" '{to: $id, text: "Answer the user by message with the single word ok."}')" >/dev/null
+for _ in $(seq 90); do
+  [ "$(control collect '{}' | jq -r '.messages[0].text // empty')" = ok ] && { echo "smoke: $agent ok"; exit; }
+  sleep 1
+done
+echo "smoke: no answer from the thread" >&2; exit 1

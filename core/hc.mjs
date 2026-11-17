@@ -3,10 +3,12 @@ import { promisify } from "node:util";
 import { alive } from "./store.mjs";
 
 const run = promisify(execFile);
+const env = { ...process.env };
+delete env.HC_TERMINAL_ID;
 
 async function command(program, args) {
   try {
-    const { stdout } = await run(program, args, { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout } = await run(program, args, { env, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 });
     return JSON.parse(stdout);
   } catch (error) {
     let message;
@@ -19,21 +21,33 @@ export function hc(io, args) {
   return (io.command ?? command)("hc", args);
 }
 
-// projects.pid is `<agent pid>@<terminal pid>`. A terminal holds the session while that agent is alive
-// and the terminal still runs the program it ran then: one hc brought back after a restart has a new pid.
-export function holds(row, id) {
-  const [agent, terminal] = (row.labels?.["projects.pid"] ?? "").split("@");
-  return row.state === "live" && row.labels?.["projects.session"] === id && Number(terminal) === row.pid && alive(Number(agent));
+export function agentPid(row) {
+  return Number((row.labels?.["projects.pid"] ?? "").split("@")[0]);
 }
 
-// `running` once the agent reports a status, `starting` while it is alive without one, else `stopped`.
-// `labelled` also lists terminals left behind by an agent that died.
+function terminalPid(row) {
+  return Number((row.labels?.["projects.pid"] ?? "").split("@")[1]);
+}
+
+export function holds(row, id) {
+  return row.state === "live" && row.labels?.["projects.session"] === id && terminalPid(row) === row.pid && alive(agentPid(row));
+}
+
+export function standIn(row) {
+  const program = terminalPid(row);
+  return program > 0 && program !== row.pid && !row.status?.state && row.foreground?.pid === row.pid;
+}
+
+export function entered(row, id) {
+  return holds(row, id) && row.labels["projects.bound"] === "1";
+}
+
 export function classify(rows, id) {
   const labelled = rows.filter(row => row.state === "live" && row.labels?.["projects.session"] === id);
-  const agents = labelled.filter(row => holds(row, id));
-  const running = agents.find(row => row.status?.state);
+  const holding = labelled.filter(row => holds(row, id));
+  const running = holding.find(row => entered(row, id) && row.status?.state);
   if (running) return { state: "running", status: running.status.state, terminal: running, labelled };
-  if (agents.length) return { state: "starting", terminal: agents[0], labelled };
+  if (holding.length) return { state: "starting", terminal: holding[0], labelled };
   return { state: "stopped", labelled };
 }
 

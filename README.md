@@ -2,65 +2,79 @@
 
 Long-running projects for coding agents in [herdr](https://herdr.dev) terminals. A project is one agent session that coordinates: it starts threads, which are other sessions that keep running on their own, that you can open and talk to, and that report back.
 
-Works with [Pi](https://pi.dev) today. Other agents can plug in through [CONTRACT.md](CONTRACT.md).
+Works with [Pi](https://pi.dev), [omp](https://omp.sh) and [Claude Code](https://code.claude.com), also mixed in one project. Another agent plugs in by meeting [CONTRACT.md](CONTRACT.md).
 
-## Install (Pi)
+## What you need
+
+Linux or macOS, herdr with `hc` (herdr-core) 0.1.20 or newer, Node 22.19 or newer on `PATH`, and at least one of the agents below. The sidebar that shows projects in herdr is [herdr-project-spaces](https://github.com/ingur/herdr-project-spaces); install this package first.
+
+## How it works
+
+- Start your agent in a herdr terminal and make the conversation a project with the agent's command below.
+- The coordinator gets five tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`. A thread gets `thread_list`, `thread_send` and `thread_rename`.
+- A thread can run on any installed agent; the coordinator names it when it starts the thread.
+- Your typing always comes first. Messages from other sessions wait.
+- Closing a project closes its threads. Opening it again, from the sidebar or by resuming its conversation in the agent, brings back the ones that were open.
+- After a reboot, projects stay stopped until you open them.
+- A report to a closed project waits until you open it.
+- Write in a resolved thread to reopen it.
+- The project's title is shown as the agent's session name. Rename from the sidebar.
+- Only you can delete.
+- State lives in `~/.local/state/herdr-projects`, per machine. Nothing is written into your repo.
+
+## Pi
 
 ```sh
 pi install git:github.com/ingur/herdr-projects
 ```
 
-Linux and macOS. Needs herdr, `hc` (herdr-core) 0.1.20 or newer, Pi 1.5 and Node 22.19 or newer.
-
-Install this first, then the sidebar that shows projects in herdr, [herdr-project-spaces](https://github.com/ingur/herdr-project-spaces). [pi-subagents](https://github.com/ingur/pi-subagents) adds background subagents to Pi and works on its own.
-
-## Use (Pi)
-
-Start `pi` in a herdr terminal, then:
-
-```text
-/projects new My project
-```
-
-Now ask it to start threads, or use the sidebar ([herdr-project-spaces](https://github.com/ingur/herdr-project-spaces)).
-
-| Command | |
-| --- | --- |
-| `/projects new [name]` | turn this session into a project |
-| `/projects resume [name]` | open a stopped project in this terminal |
-
-The agent gets these tools: `thread_start`, `thread_list`, `thread_send`, `thread_rename`, `thread_resolve`. A thread's agent gets only `thread_list`, `thread_send` and `thread_rename`.
-
-## Good to know
-
-- Your typing always comes first. Messages from other sessions wait.
-- Closing a project closes its threads. Resuming it brings back the ones that were open.
-- After a reboot, projects stay stopped until you open one from the sidebar or use `/projects resume`. Its previously open, unresolved threads come back too. A shell you started yourself is kept.
-- A report to a closed project waits until you resume it.
-- Write in a resolved thread to reopen it.
-- Only you can delete.
-- State lives in `~/.local/state/herdr-projects`. Nothing is written into your repo.
-- State is per machine. Another machine has its own projects.
-- Sessions start with the Pi command the project last ran with. If upgrades move Pi (as on Nix), set `PROJECTS_PI_COMMAND` to a path that stays, or a JSON array of arguments.
-
-## Update, remove (Pi)
+In Pi: `/projects new [name]`.
 
 ```sh
 pi update --extensions
 pi remove git:github.com/ingur/herdr-projects
 ```
 
-Removing the package leaves `~/.local/state/herdr-projects` behind.
+## omp
+
+```sh
+omp plugin install github:ingur/herdr-projects
+```
+
+In omp: `/projects new [name]`.
+
+```sh
+omp plugin upgrade @ingur/herdr-projects
+omp plugin uninstall @ingur/herdr-projects
+```
+
+## Claude Code
+
+```sh
+claude plugin marketplace add ingur/herdr-projects
+claude plugin install projects@herdr-projects
+```
+
+In Claude Code: `/projects:new [name]`. Claude Code asks once before a project's tool is first used in a session you started; sessions a project starts have them allowed.
+
+```sh
+claude plugin update projects@herdr-projects
+claude plugin uninstall projects@herdr-projects
+```
 
 ## Develop
 
 ```sh
-dev/try-pi          # runs pi with this checkout, separate from your real setup
-node --test tests/*.test.mjs
+dev/try-pi          # the agent with this checkout, on its own folders under .state/
+dev/try-omp
+dev/try-claude
+dev/smoke pi        # one project and one thread of that agent on a separate hc core
+npm test
 ```
 
 ## Known limits
 
 - Messages wait while you type, but a draft left alone for a minute no longer holds them.
 - A picker open in the agent swallows a message.
-- Threads get hc's environment plus the coordinator's `PATH` and Pi's own settings, not other variables exported only in the coordinator's shell.
+- A session starts with herdr's environment plus the few variables its agent needs, as that agent last ran here; not with variables exported only in one shell.
+- An agent that asks a question at startup (a login, a folder trust) gets no messages until you answer it.
