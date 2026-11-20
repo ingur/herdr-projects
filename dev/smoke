@@ -1,32 +1,30 @@
 #!/bin/sh
+# One project and one thread on a separate hc core. Log in once with dev/try-pi first.
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-agent=${1:?usage: dev/smoke pi|omp|claude  (log in once with dev/try-AGENT first)}
-case $agent in claude) new="/projects:new Smoke" ;; *) new="/projects new Smoke" ;; esac
 
 unset HC_TERMINAL_ID HC_TERMINAL_SOCKET HC_SCOPE
-export HC_SESSION=projects-smoke
+export HC_SESSION=p-smoke
 state="$repo/.state/herdr-projects-smoke"
-trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$state" "${XDG_STATE_HOME:-$HOME/.local/state}/herdr-core/projects-smoke"' EXIT
+trap 'hc server stop >/dev/null 2>&1 || true; rm -rf "$state" "${XDG_STATE_HOME:-$HOME/.local/state}/herdr-core/p-smoke"' EXIT
 
-control() { PROJECTS_STATE_DIR="$state" node "$repo/core/control.mjs" "$@"; }
+control() { PROJECTS_STATE_DIR="$state" node "$repo/control.mjs" "$@"; }
 field() { control list '{}' | jq -r --arg title "$1" --arg field "$2" '.sessions[] | select(.title == $title) | .[$field]'; }
 expect() {
   for _ in $(seq 60); do [ "$(field "$1" "$2")" = "$3" ] && return; sleep 1; done
   echo "smoke: $1 never had $2 = $3" >&2; exit 1
 }
 
-terminal=$(hc run --bg --json --no-parent --cwd "$repo" -- env PROJECTS_STATE_DIR="$state" "$repo/dev/try-$agent" | jq -r .address)
-hc wait --timeout 60 "$terminal" >/dev/null
-hc send "$terminal" "$new" >/dev/null
-expect Smoke state running
+terminal=$(hc run --bg --json --no-parent --cwd "$repo" -- env PROJECTS_STATE_DIR="$state" "$repo/dev/try-pi" | jq -r .address)
+expect "New session" state running
+# The user types the one command there is; everything after it goes through core.
+hc send "$terminal" "/projects new Smoke" >/dev/null
+expect Smoke kind coordinator
 
 control create-thread "$(jq -nc --arg id "$(field Smoke id)" '{coordinator: $id, title: "Helper"}')" >/dev/null
 expect Helper state running
 
 control send "$(jq -nc --arg id "$(field Helper id)" '{to: $id, text: "Answer the user by message with the single word ok."}')" >/dev/null
-for _ in $(seq 90); do
-  [ "$(control collect '{}' | jq -r '.messages[0].text // empty')" = ok ] && { echo "smoke: $agent ok"; exit; }
-  sleep 1
-done
-echo "smoke: no answer from the thread" >&2; exit 1
+answer=$(control collect '{"wait": 90}' | jq -r '.messages[0].text // empty')
+[ "$answer" = ok ] && { echo "smoke: ok"; exit; }
+echo "smoke: the thread answered \"$answer\", not ok" >&2; exit 1

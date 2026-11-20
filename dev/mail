@@ -1,0 +1,368 @@
+#!/usr/bin/env node
+// The mail cases on real pi and real hc. The model is scripted here, so a run costs nothing and needs no login.
+// `dev/mail` runs every case; `dev/mail esc compact` runs those two.
+import { execFile } from "node:child_process";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const repo = fileURLToPath(new URL("..", import.meta.url)), root = join(repo, ".state", "mail");
+const stateDir = join(root, "herdr-projects"), folder = join(root, "work"), agentDir = join(root, "pi");
+const core = "p-mail", coreState = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "herdr-core", core);
+
+for (const name of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"]) delete process.env[name];
+Object.assign(process.env, { HC_SESSION: core, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" });
+const client = await import("../core/client.mjs"), mailbox = await import("../core/mailbox.mjs"), adapter = await import("../pi/adapter.mjs");
+const io = { adapter }, run = promisify(execFile);
+
+// The model. The last text it is given decides its answer: `DO tool {json}` calls that tool, `SLEEP n` runs
+// `sleep n`, a request to summarize gets `summary`, anything else is echoed without its tags. After a tool result it says ok.
+const requests = [], model = { delay: 0, summary: { text: "Summary." } };
+const textOf = message => typeof message.content === "string" ? message.content : (message.content ?? []).map(part => part.text ?? "").join("\n");
+
+function answer(messages) {
+  if (textOf(messages[0]).includes("summarization")) return model.summary;
+  const last = messages.at(-1), said = textOf(last);
+  if (last.role === "tool") return { text: "ok" };
+  const call = [...said.matchAll(/^DO (\w+) (\{.*\})$/gm)].at(-1), sleep = said.match(/^SLEEP (\d+)$/m);
+  if (call) return { tool: call[1], args: call[2] };
+  if (sleep) return { tool: "bash", args: JSON.stringify({ command: `sleep ${sleep[1]}` }) };
+  return { text: `echo: ${said.replace(/<[^>]*>/g, "").trim().replace(/\s+/g, " ").slice(0, 60)}` };
+}
+
+const server = createServer((request, response) => {
+  let body = "";
+  request.on("data", chunk => { body += chunk; });
+  request.on("end", async () => {
+    const { messages, tools = [] } = JSON.parse(body), names = tools.map(tool => tool.function.name);
+    const entry = {
+      from: names.includes("thread_start") ? "coordinator" : names.includes("thread_list") ? "thread" : "summary",
+      messages: messages.map(message => ({ role: message.role, text: textOf(message) })), asked: Date.now(),
+    };
+    requests.push(entry);
+    await new Promise(done => setTimeout(done, model.delay * 1000));
+    entry.answered = Date.now();
+    const reply = answer(messages);
+    const chunk = (delta, finish = null) => response.write(`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", model: "script", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    if (reply.text) chunk({ role: "assistant", content: reply.text });
+    else chunk({ role: "assistant", tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: reply.tool, arguments: reply.args } }] });
+    chunk({}, reply.text ? "stop" : "tool_calls");
+    response.write(`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", model: "script", choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } })}\n\n`);
+    response.end("data: [DONE]\n\n");
+  });
+});
+
+const hc = async (...args) => (await run("hc", args)).stdout;
+const pause = seconds => new Promise(done => setTimeout(done, seconds * 1000));
+
+async function until(what, check, seconds = 30) {
+  for (const end = Date.now() + seconds * 1000; Date.now() < end; await pause(0.1)) {
+    const found = await check();
+    if (found) return found;
+  }
+  throw new Error(`never happened: ${what}`);
+}
+
+function expect(truth, what) {
+  if (!truth) throw new Error(`expected: ${what}`);
+}
+
+const view = async id => (await client.list({ stateDir }, io)).sessions.find(session => session.id === id);
+const terminal = async id => (await view(id)).terminal;
+const from = kind => requests.filter(request => request.from === kind);
+// How many of the items core wrote into the conversation open with `opening` and hold `word`.
+const items = request => request.messages.filter(message => message.role === "user").map(message => message.text).join("\n").match(/<(message|copy|typed) [^>]*>[^]*?<\/\1>/g) ?? [];
+const holds = (request, opening, word) => items(request).filter(item => new RegExp(`^<${opening}[ >]`).test(item) && item.includes(word)).length;
+const startedBy = (kind, word) => from(kind).filter(request => holds({ messages: request.messages.slice(-1) }, "message", word)).length;
+const send = (to, text) => client.send({ stateDir, to, text }, io);
+const type = async (id, text) => hc("send", await terminal(id), text);
+const press = async (id, ...keys) => hc("keys", await terminal(id), ...keys);
+const screen = async id => hc("read", await terminal(id));
+
+// The next request the session makes after `count` of them.
+const next = (kind, count) => until(`a run of the ${kind}`, () => from(kind)[count]);
+
+// No run, nothing queued, and every item out of the mailbox.
+const quiet = id => until("the session is idle with an empty mailbox", async () => {
+  const { state, status } = await view(id);
+  return state === "running" && status !== "working" && !mailbox.read(stateDir, id).items.length;
+});
+
+// The model's answer to the typed prompt is on its way back to the session.
+async function prompt(id, kind, word) {
+  await type(id, word);
+  return until(`the prompt ${word}`, () => from(kind).find(request => request.answered && request.messages.at(-1).text.includes(word)));
+}
+
+// The conversation as the model is given it at the session's next prompt.
+async function conversation(id, kind, word) {
+  await quiet(id);
+  const request = await prompt(id, kind, word);
+  await quiet(id);
+  return request;
+}
+
+async function start() {
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(folder, { recursive: true });
+  mkdirSync(agentDir);
+  await new Promise(done => server.listen(0, "127.0.0.1", done));
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { script: {
+    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: "openai-completions", apiKey: "none",
+    models: [{ id: "script", name: "script", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+  } } }));
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+    defaultProvider: "script", defaultModel: "script", packages: [repo], compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 },
+  }));
+  await hc("run", "--bg", "--json", "--no-parent", "--cwd", folder, "--", "env", `PROJECTS_STATE_DIR=${stateDir}`, "NO_PROXY=127.0.0.1", "pi");
+  const plain = await until("pi is a session", async () => (await client.list({ stateDir }, io)).sessions.find(session => session.state === "running"));
+  await type(plain.id, "/projects new Check");
+  await until("the session is a project", async () => (await view(plain.id)).kind === "coordinator");
+  await conversation(plain.id, "coordinator", "hello");
+  const worker = await client.createThread({ stateDir, coordinator: plain.id, title: "Worker" }, io);
+  expect(!worker.error, `the thread starts: ${worker.error}`);
+  await quiet(worker.id);
+  return { C: plain.id, W: worker.id };
+}
+
+const cases = {
+  async idle({ W }) {
+    const count = from("thread").length, sent = Date.now();
+    await send(W, "idle-1");
+    const request = await next("thread", count);
+    expect(startedBy("thread", "idle-1") === 1, "the run starts with the message");
+    expect(request.asked - sent < 1000, `the mail is noticed within a second, not ${request.asked - sent} ms`);
+    expect(holds(await conversation(W, "thread", "after-idle"), "message", "idle-1") === 1, "the message is in the conversation once");
+  },
+
+  async draft({ W }) {
+    const count = from("thread").length;
+    await press(W, "d", "r", "a", "f", "t");
+    await send(W, "draft-1");
+    await next("thread", count);
+    await quiet(W);
+    expect((await screen(W)).includes("draft"), "the draft is still in the input box");
+    await press(W, ..."draft".split("").map(() => "backspace"));
+  },
+
+  async working({ W }) {
+    await prompt(W, "thread", "SLEEP 4");
+    await send(W, "working-1");
+    const { messages } = await conversation(W, "thread", "after-working");
+    const result = messages.findLastIndex(message => message.role === "tool"), mail = messages.findIndex(message => message.text.includes("working-1"));
+    expect(holds({ messages }, "message", "working-1") === 1, "the message is in the conversation once");
+    expect(mail === result + 1, "the message comes right after the running tool's result");
+  },
+
+  async order({ W }) {
+    await send(W, "order-1");
+    await send(W, "order-2");
+    const { messages } = await conversation(W, "thread", "after-order");
+    const first = messages.findIndex(message => message.text.includes("order-1")), second = messages.findIndex(message => message.text.includes("order-2"));
+    expect(holds({ messages }, "message", "order-1") === 1 && holds({ messages }, "message", "order-2") === 1, "each message is in the conversation once");
+    expect(first < second, "the messages are in the order sent");
+  },
+
+  async esc({ W }) {
+    await prompt(W, "thread", "SLEEP 20");
+    await send(W, "esc-1");
+    let count = from("thread").length;
+    await press(W, "esc");
+    await next("thread", count);
+    await quiet(W);
+    expect(startedBy("thread", "esc-1") === 1, "after Esc, the waiting message starts one run");
+
+    model.delay = 5;
+    count = from("thread").length;
+    await send(W, "esc-2");
+    await next("thread", count);
+    await press(W, "esc");
+    model.delay = 0;
+    await quiet(W);
+    await pause(2);
+    expect(from("thread").length === count + 1, "Esc on the run a message started stops it for good");
+    const request = await conversation(W, "thread", "after-esc");
+    expect(holds(request, "message", "esc-1") === 1 && holds(request, "message", "esc-2") === 1, "each message is in the conversation once");
+  },
+
+  async killed({ W }) {
+    await prompt(W, "thread", "SLEEP 20");
+    await send(W, "killed-1");
+    const { pid } = JSON.parse(await hc("get", await terminal(W), "--json")), count = from("thread").length;
+    process.kill(pid, "SIGKILL");
+    await until("the session is stopped", async () => (await view(W)).state === "stopped");
+    expect((await view(W)).waiting === 1, "the message still waits");
+    await client.open({ stateDir, id: W }, io);
+    await next("thread", count);
+    expect(holds(await conversation(W, "thread", "after-killed"), "message", "killed-1") === 1, "the message is in the conversation once");
+    expect(startedBy("thread", "killed-1") === 1, "the opened session starts one run with the message");
+  },
+
+  async copy({ C, W }) {
+    let count = from("coordinator").length;
+    await send(W, "copy-1");
+    await quiet(W);
+    await quiet(C);
+    expect(from("coordinator").length === count, "a copy starts no run");
+
+    await prompt(C, "coordinator", "SLEEP 4");
+    await send(W, "copy-2");
+    await quiet(W);
+    await quiet(C);
+    expect(from("coordinator").length === count + 2, "a copy adds no step to a working coordinator");
+    const request = await conversation(C, "coordinator", "after-copy");
+    expect(holds(request, "copy", "copy-1") === 1 && holds(request, "copy", "copy-2") === 1, "each copy is in the conversation once");
+  },
+
+  async opened({ C, W }) {
+    await client.close({ stateDir, id: C }, io);
+    const count = from("coordinator").length;
+    await send(W, "opened-1");
+    await send(W, "opened-2");
+    await quiet(W);
+    await client.open({ stateDir, id: C }, io);
+    await quiet(C);
+    expect(from("coordinator").length === count, "copies that waited for a closed coordinator start no run");
+    const request = await conversation(C, "coordinator", "after-opened");
+    expect(holds(request, "copy", "opened-1") === 1 && holds(request, "copy", "opened-2") === 1, "each copy is in the conversation once");
+  },
+
+  async typed({ C, W }) {
+    await conversation(W, "thread", "typed-1");
+    const request = await conversation(C, "coordinator", "after-typed");
+    expect(holds(request, "copy", "typed-1") === 2, "the coordinator has a copy of the prompt and of the answer");
+    expect(holds(request, "typed", "after-typed") === 1, "the user's own prompt carries its id");
+  },
+
+  async compact({ W }) {
+    await compaction(W, "compact-1", { text: "Summary." });
+  },
+
+  async compactFailed({ W }) {
+    await compaction(W, "failed-1", { tool: "bash", args: "{}" });
+  },
+
+  async compactWhileWorking({ W }) {
+    await prompt(W, "thread", "SLEEP 20");
+    await send(W, "busy-1");
+    await type(W, "/compact");
+    await conversation(W, "thread", "after-busy");
+    expect(startedBy("thread", "busy-1") === 1, "the waiting message starts one run");
+  },
+
+  async fresh({ W }) {
+    await prompt(W, "thread", "SLEEP 20");
+    await send(W, "fresh-1");
+    const count = from("thread").length;
+    await press(W, ..."/new", "enter");
+    const request = await next("thread", count);
+    expect(request.messages.every(message => !message.text.includes("SLEEP 20")), "the message is answered in the new conversation");
+    expect(holds(await conversation(W, "thread", "after-fresh"), "message", "fresh-1") === 1, "the message is in the new conversation once");
+    expect(startedBy("thread", "fresh-1") === 1, "the message starts one run");
+  },
+
+  async tree({ W }) {
+    await conversation(W, "thread", "tree-one");
+    await conversation(W, "thread", "tree-two");
+    const summaries = from("summary").length, count = from("thread").length;
+    await type(W, "/tree");
+    await pause(1);
+    await press(W, "up", "up");
+    await pause(1);
+    await press(W, "enter");
+    await pause(1);
+    await press(W, "down");
+    model.delay = 4;
+    await press(W, "enter");
+    const summarizing = await next("summary", summaries);
+    await send(W, "tree-1");
+    model.delay = 0;
+    const request = await next("thread", count);
+    expect(request.asked >= summarizing.answered, "the run starts after the move in the tree");
+    expect(startedBy("thread", "tree-1") === 1, "the message starts one run");
+  },
+
+  async between({ C, W }) {
+    await quiet(C);
+    await type(C, 'DO thread_start {"title":"Peer","instruction":"between-1"}');
+    const peer = await until("the coordinator's thread runs", async () => (await client.list({ stateDir }, io)).sessions.find(session => session.title === "Peer" && session.state === "running"));
+    await quiet(peer.id);
+    await type(peer.id, `DO message_send {"to":"${W}","text":"between-2"}`);
+    await quiet(W);
+    await type(W, 'DO message_send {"to":"coordinator","text":"between-3"}');
+    await until("the coordinator answers the thread's message", () => startedBy("coordinator", "between-3") === 1);
+    const worker = await conversation(W, "thread", "after-between"), coordinator = await conversation(C, "coordinator", "after-between");
+    expect(startedBy("thread", "between-1") === 1 && startedBy("thread", "between-2") === 1, "each message between sessions starts one run");
+    expect(holds(worker, `message id="[^"]+" from="${peer.id}" from-title="Peer"`, "between-2") === 1, "a message gives its sender's address and title");
+    expect(holds(coordinator, `message id="[^"]+" from="${W}" from-title="Worker"`, "between-3") === 1, "the coordinator has the thread's message once");
+    expect(holds(coordinator, `copy id="[^"]+" from="${peer.id}" from-title="Peer" to="${W}" to-title="Worker"`, "between-2") === 1, "the coordinator has a copy of what its threads say to each other");
+    expect(holds(coordinator, 'copy id="[^"]+" from="coordinator"', "between-1") === 0, "the coordinator has no copy of its own mail");
+  },
+
+  async attach({ C, W }) {
+    const typed = items(await conversation(C, "coordinator", "attach-1")).find(item => item.startsWith("<typed") && item.includes("attach-1"));
+    const [, id] = typed.match(/id="([^"]+)"/);
+    await type(C, `DO message_send {"to":"${W}","text":"attach-2","attach":["${id}"]}`);
+    await until("the thread answers the coordinator's message", () => startedBy("thread", "attach-2") === 1);
+    const mail = items(await conversation(W, "thread", "after-attach")).find(item => item.includes("attach-2"));
+    expect(mail.includes(`<attached from="user" id="${id}">\nattach-1\n</attached>`), "the message carries the user's own words, by their id");
+  },
+
+  async reply({ W }) {
+    await quiet(W);
+    await type(W, 'DO message_send {"to":"user","text":"reply-1"}');
+    const { messages } = await client.collect({ stateDir, wait: 30 });
+    expect(messages.length === 1 && messages[0].text === "reply-1", "the user collects the agent's message");
+    await client.collect({ stateDir, taken: [messages[0].id] });
+  },
+
+  async name({ W }) {
+    await type(W, "/name Renamed");
+    await until("the title is the name given in pi", async () => (await view(W)).title === "Renamed");
+    expect((await view(W)).titleSource === "user", "a name given in pi counts as the user's");
+  },
+};
+
+// A message that arrives while pi compacts waits, and starts one run when the compaction is over.
+async function compaction(W, word, summary) {
+  await quiet(W);
+  const summaries = from("summary").length, count = from("thread").length;
+  Object.assign(model, { delay: 4, summary });
+  await type(W, "/compact");
+  const summarizing = await next("summary", summaries);
+  await send(W, word);
+  model.delay = 0;
+  const request = await next("thread", count);
+  expect(request.asked >= summarizing.answered, "the run starts after the compaction");
+  expect(holds(await conversation(W, "thread", `after-${word}`), "message", word) === 1, "the message is in the conversation once");
+  expect(startedBy("thread", word) === 1, "the message starts one run");
+}
+
+const chosen = process.argv.slice(2);
+const unknown = chosen.filter(name => !Object.hasOwn(cases, name));
+if (unknown.length) throw new Error(`no case ${unknown.join(", ")}; there are ${Object.keys(cases).join(", ")}`);
+
+let failed = 0;
+try {
+  const sessions = await start();
+  for (const name of chosen.length ? chosen : Object.keys(cases)) {
+    try {
+      await cases[name](sessions);
+      console.log(`ok      ${name}`);
+    } catch (error) {
+      failed += 1;
+      console.log(`FAILED  ${name}: ${error.message}`);
+      Object.assign(model, { delay: 0, summary: { text: "Summary." } });
+    }
+  }
+} finally {
+  await hc("server", "stop").catch(() => {});
+  server.close();
+  rmSync(root, { recursive: true, force: true });
+  rmSync(coreState, { recursive: true, force: true });
+}
+process.exitCode = failed ? 1 : 0;

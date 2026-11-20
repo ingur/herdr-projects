@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-case $repo in "$HOME"/*) ;; *) echo "try-omp: omp keeps its folder under HOME, and this checkout is not" >&2; exit 1 ;; esac
-export PI_CONFIG_DIR="${repo#"$HOME"/}/.state/omp"
-export PROJECTS_STATE_DIR="${PROJECTS_STATE_DIR:-$repo/.state/herdr-projects}"
-omp plugin link "$repo" >/dev/null
-exec omp "$@"

@@ -1,13 +1,13 @@
 {
   "name": "@ingur/herdr-projects",
-  "version": "0.2.0",
-  "description": "Long-running projects for coding agents in herdr terminals",
+  "version": "0.3.0",
+  "description": "Sessions, projects and mail for pi in herdr terminals",
   "type": "module",
   "license": "MIT",
   "repository": "github:ingur/herdr-projects",
-  "files": ["adapters.mjs", "core", "pi", "omp", "claude", ".claude-plugin", "CONTRACT.md"],
+  "files": ["control.mjs", "core", "herdr", "pi", "CONTRACT.md"],
   "engines": { "node": ">=22.19" },
   "scripts": { "test": "node --test tests/*.test.mjs" },
-  "pi": { "extensions": ["./pi/integration.ts"] },
-  "omp": { "extensions": ["./omp/integration.ts"] }
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*" },
+  "pi": { "extensions": ["./pi/extension.ts"] }
 }

@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-export CLAUDE_CONFIG_DIR="$repo/.state/claude" CLAUDE_CODE_PLUGIN_DIRS="$repo" DISABLE_AUTOUPDATER=1
-export PROJECTS_STATE_DIR="${PROJECTS_STATE_DIR:-$repo/.state/herdr-projects}"
-exec claude "$@"
