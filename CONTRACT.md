@@ -40,10 +40,10 @@ Most actions return the session's view:
 ```
 id, kind, project (not for plain), title, titleSource: "placeholder" | "agent" | "user", folder,
 resolved, rank, created, space, tab, terminal (where its agent runs),
-state, status (only when running), interrupted, waiting (messages in its mailbox), error?
+state, status (only when running), waiting (messages in its mailbox), error?
 ```
 
-`interrupted` says the session is stopped and its tab came back as an empty shell, as after a herdr restart; `terminal` is then that shell.
+A stopped session whose tab came back as an empty shell, as after a herdr restart, has that shell as its `terminal`.
 
 A call that is refused throws. `error` on a view says that the call was carried out, but the session could not be started or herdr-core could not be asked about it. `errors` in a list is `[{id, error}]`: the records or mail files that could not be read, which the rest does not wait for.
 

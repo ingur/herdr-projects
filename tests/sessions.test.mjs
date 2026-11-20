@@ -164,7 +164,7 @@ test("opening a session starts it in its tab, then closes the empty shell hc put
   assert.equal(f.io.rows.at(-1).labels["projects.launched"], "1");
 });
 
-test("the list says which sessions are interrupted: stopped, their tab back as an empty shell", async t => {
+test("a stopped session whose tab came back as an empty shell has that shell as its terminal, and no other stopped one has any", async t => {
   const f = fixture(t), restored = f.save({ title: "Restored", rank: 3 }), closed = f.save({ title: "Closed", rank: 2 }), running = f.save({ title: "Running", rank: 1 });
   const shell = f.io.terminal(f.left(restored.id), null);
   shell.pid = ME + 1;
@@ -172,8 +172,8 @@ test("the list says which sessions are interrupted: stopped, their tab back as a
   f.io.terminal(f.waiting(closed.id), null);
   f.io.terminal(f.bound(running.id));
 
-  assert.deepEqual((await f.client.list()).sessions.map(view => [view.title, view.interrupted, view.terminal]),
-    [["Restored", true, shell.address], ["Closed", false, undefined], ["Running", false, "t3"]]);
+  assert.deepEqual((await f.client.list()).sessions.map(view => [view.title, view.state, view.terminal]),
+    [["Restored", "stopped", shell.address], ["Closed", "stopped", undefined], ["Running", "running", "t3"]]);
 });
 
 test("the list has each project with its threads under it, unresolved first, then plain sessions, highest rank first", async t => {

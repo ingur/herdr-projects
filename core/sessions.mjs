@@ -44,7 +44,6 @@ function view(stateDir, record, observed, error) {
     space: own?.labels["herdr.space"] ?? record.space, tab: own?.labels["herdr.tab"] ?? record.tab,
     ...(own ? { terminal: own.address } : {}),
     state, ...(observed?.status ? { status: observed.status } : {}),
-    interrupted: Boolean(observed?.shell),
     waiting: mailbox.waiting(stateDir, record.id),
     ...(error ? { error } : {}),
   };
