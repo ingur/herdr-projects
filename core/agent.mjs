@@ -63,9 +63,11 @@ export const tools = [
       instruction: text("The thread's first message, and all it knows at the start. Give the goal, the relevant paths, what done looks like, and what to send back.", 100000),
       folder: { type: "string", description: "Folder the thread works in: absolute, or relative to the coordinator's folder, which is the default. Threads in the same folder share files; for parallel edits to one repository, create a git worktree and pass it here." },
       attach,
+      model: text("Model the thread's agent starts with, as provider/model. Leave out for the user's default.", 200),
+      thinking: { type: "string", enum: threads.THINKING, description: "Thinking level the thread's agent starts with. Leave out for the user's default." },
     }, ["title", "instruction"]),
     async run(stateDir, me, args, io) {
-      return brief(await threads.start(stateDir, me, { title: args.title, text: args.instruction, folder: args.folder, attach: args.attach }, "agent", io));
+      return brief(await threads.start(stateDir, me, { title: args.title, text: args.instruction, folder: args.folder, attach: args.attach, model: args.model, thinking: args.thinking }, "agent", io));
     },
   },
   {
@@ -90,12 +92,17 @@ export const tools = [
   },
 ];
 
-export async function act(options, io) {
+function run(options, io) {
   const stateDir = stateDirectory(options.stateDir), me = session(stateDir, options.id);
   const tool = tools.find(tool => tool.name === options.tool);
   if (!tool) throw new Error(`No tool ${JSON.stringify(options.tool)}`);
   if (!tool.kinds.includes(me.kind)) throw new Error(`${tool.name} is not a tool of a ${me.kind} session`);
-  return messages.inert(await tool.run(stateDir, me, options.args ?? {}, io));
+  return tool.run(stateDir, me, options.args ?? {}, io);
+}
+
+export async function act(options, io) {
+  try { return messages.inert(await run(options, io)); }
+  catch (error) { throw new Error(messages.inert(error.message), { cause: error }); }
 }
 
 const everyone = [

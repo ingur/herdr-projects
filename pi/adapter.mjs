@@ -4,8 +4,8 @@ import { existsSync, rmSync } from "node:fs";
 
 export const variables = ["PATH", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"];
 
-export function start() {
-  return ["pi"];
+export function start({ model, thinking } = {}) {
+  return ["pi", ...(model ? ["--model", model] : []), ...(thinking ? ["--thinking", thinking] : [])];
 }
 
 // pi writes the session file with the first prompt or answer; before that there is nothing to continue.

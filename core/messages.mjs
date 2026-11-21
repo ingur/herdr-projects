@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as log from "./log.mjs";
 import * as mailbox from "./mailbox.mjs";
 import { changed, launch, member } from "./sessions.mjs";
-import { session, update } from "./state.mjs";
+import { locked, rewrite, session } from "./state.mjs";
 
 const COPY_LENGTH = 2000;
 
@@ -68,9 +68,9 @@ export function save(stateDir, sender, receiver, { text, attached }) {
   };
   const project = sender?.project ?? receiver?.project;
   if (project) log.record(stateDir, project, item);
-  mailbox.put(stateDir, receiver?.id ?? "user", item);
   const thread = [sender, receiver].find(record => record?.kind === "thread");
   if (thread && sender?.kind !== "coordinator" && receiver?.kind !== "coordinator") copy(stateDir, thread.project, item);
+  mailbox.put(stateDir, receiver?.id ?? "user", item);
   return item;
 }
 
@@ -82,11 +82,14 @@ export async function send(stateDir, sender, to, value, attach, io) {
     return {};
   }
   const receiver = recipient(stateDir, sender, to);
-  if (receiver.resolved) {
-    if (sender?.kind === "thread" && receiver.kind === "thread") throw new Error("This thread is resolved; only its coordinator or the user can reopen it");
-    await update(stateDir, receiver.id, () => ({ resolved: false }), io);
-  }
-  save(stateDir, sender, receiver, checked);
+  await locked(stateDir, receiver.id, () => {
+    const current = session(stateDir, receiver.id);
+    if (current.resolved) {
+      if (sender?.kind === "thread" && current.kind === "thread") throw new Error("This thread is resolved; only its coordinator or the user can reopen it");
+      rewrite(stateDir, receiver.id, () => ({ resolved: false }));
+    }
+    save(stateDir, sender, current, checked);
+  }, io);
   return changed(stateDir, receiver.id, io, receiver.kind === "thread" ? await launch(stateDir, receiver.id, io) : {});
 }
 

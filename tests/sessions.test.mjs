@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { DEAD, fixture, ME, OTHER } from "./fixture.mjs";
 
 test("every agent in a terminal is a session: a new conversation becomes a plain session", async t => {
@@ -12,6 +14,14 @@ test("every agent in a terminal is a session: a new conversation becomes a plain
   assert.deepEqual([f.record(session.id).folder, f.record(session.id).conversation], [f.folder, { id: "talk" }]);
   assert.equal(await f.state(session.id), "running");
   assert.deepEqual(f.extension.current({ id: session.id }), { session });
+});
+
+test("the command a session's terminal advertises reaches core with that session's state folder", async t => {
+  const f = fixture(t), terminal = f.io.terminal({}), { session } = await f.enter(terminal, "said-in");
+  await f.as(session.id, "message_send", { to: "user", text: "hello" });
+  const { command, stateDir } = JSON.parse(terminal.labels["projects.control"]);
+  const { stdout } = await promisify(execFile)(command[0], [...command.slice(1), "collect", JSON.stringify({ stateDir })]);
+  assert.deepEqual([stateDir, JSON.parse(stdout).messages.map(message => message.text)], [f.stateDir, ["hello"]]);
 });
 
 test("a session core started is entered by the first agent in its terminal, and by no other process after it", async t => {
@@ -104,6 +114,22 @@ test("a plain session with no conversation to come back to and no mail does not 
   assert.equal((await f.client.list()).sessions.find(view => view.id === kept.id).waiting, 1);
 });
 
+test("a message sent while a plain session goes with its agent is refused, not dropped", async t => {
+  const f = fixture(t), terminal = f.io.terminal({}), { session } = await f.enter(terminal, "never-saved");
+  let reached, proceed;
+  const unlabelling = new Promise(resolve => { reached = resolve; }), gate = new Promise(resolve => { proceed = resolve; });
+  const slow = { ...f.io, command: async (program, args) => {
+    if (args[0] === "label" && args.includes("projects.session=")) { reached(); await gate; }
+    return f.io.command(program, args);
+  } };
+  const leaving = f.extension.leave({ terminal: terminal.address, pid: ME }, slow);
+  await unlabelling;
+  const refused = assert.rejects(f.client.send({ to: session.id, text: "too late" }), /No session/);
+  proceed();
+  await Promise.all([leaving, refused]);
+  assert.deepEqual([f.record(session.id), existsSync(join(f.stateDir, "mailboxes", session.id))], [undefined, false]);
+});
+
 test("an agent starts with the environment its adapter named, as last seen, in the session's folder", async t => {
   const f = fixture(t), coordinator = f.project({ conversation: { id: "talk" } }), elsewhere = join(f.folder, "sub");
   mkdirSync(elsewhere);
@@ -134,7 +160,28 @@ test("a thread is started under a coordinator; titles may repeat, and one withou
   await assert.rejects(f.client.createThread({ coordinator: first.id }), /under a coordinator/);
 });
 
-test("closing a project closes its threads, and entering it again brings the open ones back", async t => {
+test("a thread starts on the model and thinking it was given each time it starts fresh; a saved conversation continues as it was", async t => {
+  const f = fixture(t), project = f.project();
+  const program = () => { const args = f.runs().at(-1); return args.slice(args.indexOf("tool")); };
+  const worker = await f.as(project.id, "thread_start", { title: "Worker", instruction: "go", model: "a/model", thinking: "high" });
+  assert.deepEqual(program(), ["tool", "a/model", "high"]);
+
+  await f.enter(f.io.rows.at(-1), "unsaved");
+  await f.client.close({ id: worker.id });
+  await f.client.open({ id: worker.id });
+  assert.deepEqual(program(), ["tool", "a/model", "high"]);
+
+  await f.extension.enter({ folder: f.folder, terminal: f.io.rows.at(-1).address, pid: ME, conversation: { id: "kept", saved: true }, env: {} });
+  await f.client.close({ id: worker.id });
+  await f.client.open({ id: worker.id });
+  assert.deepEqual(program(), ["tool", "--resume", "kept"]);
+
+  await f.as(project.id, "thread_start", { title: "Plain", instruction: "go" });
+  assert.deepEqual(program(), ["tool"]);
+  await assert.rejects(f.as(project.id, "thread_start", { title: "Bad", instruction: "go", thinking: "ultra" }), /thinking is one of/);
+});
+
+test("closing a project closes its threads; opening it brings back its unresolved threads, and only when it opens", async t => {
   const f = fixture(t), project = f.project({ conversation: { id: "talk" } }), bystander = f.io.terminal({});
   const open = f.thread(project, "Open"), done = f.thread(project, "Done", { resolved: true }), idle = f.thread(project, "Idle");
   const terminals = [project, open, done].map(record => f.io.terminal(f.bound(record.id)));
@@ -142,10 +189,13 @@ test("closing a project closes its threads, and entering it again brings the ope
   assert.deepEqual(terminals.map(row => row.state), ["finished", "finished", "finished"]);
   assert.equal(bystander.state, "live");
 
-  await f.enter(f.io.terminal({}), "talk");
-  assert.equal(f.runs().length, 1);
-  assert.equal(f.io.rows.at(-1).labels["projects.session"], open.id);
-  assert.deepEqual([await f.state(done.id), await f.state(idle.id)], ["stopped", "stopped"]);
+  const again = f.io.terminal({});
+  await f.enter(again, "talk");
+  assert.deepEqual([await f.state(open.id), await f.state(idle.id), await f.state(done.id)], ["starting", "starting", "stopped"]);
+
+  await f.client.close({ id: idle.id });
+  await f.enter(again, "talk", { replaced: true });
+  assert.equal(await f.state(idle.id), "stopped");
 });
 
 test("opening a session starts it in its tab, then closes the empty shell hc put there, and no shell the user is in", async t => {

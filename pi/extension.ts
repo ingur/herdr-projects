@@ -9,7 +9,7 @@ type Session = { id: string; kind: "plain" | "coordinator" | "thread"; title: st
 type Attached = { id: string; text: string };
 type Mail = { id: string; type: "message" | "copy"; from: string; fromTitle?: string; text: string; attached?: Attached[]; content: string };
 type Shown = Pick<Mail, "id" | "from" | "fromTitle" | "text" | "attached">;
-type Args = { to?: string; text?: string; title?: string; thread?: string; instruction?: string; attach?: string[] };
+type Args = { to?: string; text?: string; title?: string; thread?: string; instruction?: string; attach?: string[]; model?: string };
 type Sent = { who: string; text: string; attach: string[] };
 type Row = { title: string; state: string; status?: string; resolved: boolean };
 type Details = { sessions?: Row[]; from?: string; fromTitle?: string; to?: string; toTitle?: string; text?: string; attached?: Attached[] };
@@ -57,6 +57,19 @@ const sent: Record<string, (args: Args) => Sent> = {
 const objects: Record<string, (args: Args) => string> = {
   title_set: args => args.thread === undefined ? args.title ?? "" : `${args.title ?? ""} for ${titleOf(args.thread)}`,
   thread_resolve: args => titleOf(args.thread),
+};
+
+const named = (each: { provider: string; id: string }) => `${each.provider}/${each.id}`;
+
+function model(text: string, ctx: ExtensionContext) {
+  const all = ctx.modelRegistry.getAll(), exact = all.filter(each => named(each) === text);
+  const found = exact.length ? exact : all.filter(each => each.id === text);
+  if (found.length !== 1) throw new Error(`${found.length ? "More than one model has that id" : "pi knows no model by that name"}. Give provider/model, as \`pi --list-models\` shows it.`);
+  return named(found[0]);
+}
+
+const checked: Record<string, (args: Args, ctx: ExtensionContext) => Args> = {
+  thread_start: (args, ctx) => args.model === undefined ? args : { ...args, model: model(args.model, ctx) },
 };
 
 const outputs: Record<string, (details: Details, expanded: boolean) => string | undefined> = {
@@ -239,8 +252,8 @@ export default function projects(pi: ExtensionAPI) {
   for (const tool of agent.tools) {
     pi.registerTool({
       name: tool.name, label: tool.label, description: tool.description, parameters: tool.parameters, defaultActive: false,
-      async execute(_call, args) {
-        const value = await agent.act({ id: me?.id, tool: tool.name, args }, io);
+      async execute(_call, args, _signal, _update, ctx) {
+        const value = await agent.act({ id: me?.id, tool: tool.name, args: checked[tool.name]?.(args, ctx) ?? args }, io);
         if (me) show(core.current({ id: me.id }).session);
         return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };
       },

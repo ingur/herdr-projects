@@ -4,11 +4,11 @@ import * as mailbox from "./mailbox.mjs";
 import * as messages from "./messages.mjs";
 import * as sessions from "./sessions.mjs";
 import { readRecord, removeRecord, session, stateDirectory, update } from "./state.mjs";
-import * as terminals from "./terminals.mjs";
+import * as terminals from "../herdr/terminals.mjs";
 import * as threads from "./threads.mjs";
 
 function space(value) {
-  if (typeof value !== "string" || !value || /[\x00-\x1f\x7f]/.test(value)) throw new Error("space must be a herdr space id");
+  if (typeof value !== "string" || !value || /[\x00-\x1f\x7f]/.test(value)) throw new Error("space must be a space id");
   return value;
 }
 

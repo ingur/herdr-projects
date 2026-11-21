@@ -13,9 +13,9 @@ function uses(file) {
   return [...source.matchAll(/from\s+"(\.[^"]+)"/g)].map(([, path]) => relative(root, resolve(root, dirname(file), path)).split("/")[0]);
 }
 
-test("core uses only core and herdr; herdr uses nothing of ours", () => {
+test("core uses only core and herdr; herdr uses only itself", () => {
   for (const file of files("core")) assert.deepEqual(uses(file).filter(folder => !["core", "herdr"].includes(folder)), [], file);
-  for (const file of files("herdr")) assert.deepEqual(uses(file), [], file);
+  for (const file of files("herdr")) assert.deepEqual(uses(file).filter(folder => folder !== "herdr"), [], file);
 });
 
 test("pi uses core and itself; control uses core and the adapter", () => {

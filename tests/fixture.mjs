@@ -6,7 +6,7 @@ import * as agent from "../core/agent.mjs";
 import * as client from "../core/client.mjs";
 import * as extension from "../core/extension.mjs";
 import { readRecord, writeRecord } from "../core/state.mjs";
-import { control } from "../core/terminals.mjs";
+import { control } from "../herdr/terminals.mjs";
 
 export const DEAD = 2 ** 31 - 1, ME = process.pid, OTHER = process.ppid;
 
@@ -67,7 +67,7 @@ export function fixture(t) {
   mkdirSync(folder);
   io.adapter = {
     variables: ["PATH", "TOOL_HOME"],
-    start: () => ["tool"],
+    start: ({ model, thinking }) => ["tool", ...[model, thinking].filter(Boolean)],
     resume: conversation => conversation?.saved ? ["tool", "--resume", conversation.id] : undefined,
     remove: conversation => removed.push(conversation.id),
   };

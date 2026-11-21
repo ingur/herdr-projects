@@ -76,7 +76,7 @@ const environmentPath = stateDir => join(stateDir, "environment.json");
 export const readEnvironment = stateDir => readJson(environmentPath(stateDir)) ?? {};
 export const writeEnvironment = (stateDir, env) => writeJson(environmentPath(stateDir), env);
 
-export function alive(pid) {
+function alive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; }
   catch (error) { return error.code === "EPERM"; }

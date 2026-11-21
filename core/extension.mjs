@@ -1,9 +1,9 @@
 import { isAbsolute } from "node:path";
 import * as mailbox from "./mailbox.mjs";
 import * as messages from "./messages.mjs";
-import { changed, closeThreads, create, identity, remember, rename, reopenThreads, rowsOf, title, touch, writeControl } from "./sessions.mjs";
+import { changed, closeThreads, create, identity, remember, rename, reopenThreads, rowsOf, title, touch } from "./sessions.mjs";
 import { locked, readRecord, readRecords, removeRecord, rewrite, session, stateDirectory, update, writeEnvironment } from "./state.mjs";
-import * as terminals from "./terminals.mjs";
+import * as terminals from "../herdr/terminals.mjs";
 
 function conversation(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.id !== "string" || !value.id) {
@@ -19,22 +19,24 @@ async function bind(stateDir, id, row, pid, talk, io) {
     if (other) throw new Error(`This session is already open in terminal ${other.address}`);
     await terminals.bind(io, stateDir, id, row, pid);
     await terminals.vacate(io, observed.labelled, id, row.address);
-    rewrite(stateDir, id, record => ({
-      conversation: talk, reopenWithProject: undefined,
-      space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab,
-    }));
+    const { space, tab } = terminals.place(row);
+    rewrite(stateDir, id, record => ({ conversation: talk, space: space ?? record.space, tab: tab ?? record.tab }));
+  }, io);
+}
+
+function retire(stateDir, record, row, io) {
+  return locked(stateDir, record.id, async () => {
+    if (record.kind !== "plain" || io.adapter.resume(record.conversation) || mailbox.waiting(stateDir, record.id)) return false;
+    await terminals.unlabel(io, row);
+    removeRecord(stateDir, record.id);
+    mailbox.discard(stateDir, record.id);
+    return true;
   }, io);
 }
 
 // The session stops running in this terminal. `label` says what the terminal keeps: unbind or unlabel.
-// A plain session with no conversation to continue and no mail goes with its agent.
 async function release(stateDir, record, row, io, label) {
-  if (record.kind === "plain" && !io.adapter.resume(record.conversation) && !mailbox.waiting(stateDir, record.id)) {
-    await terminals.unlabel(io, row);
-    removeRecord(stateDir, record.id);
-    mailbox.discard(stateDir, record.id);
-    return;
-  }
+  if (await retire(stateDir, record, row, io)) return;
   await remember(stateDir, record.id, row, io);
   await label(io, row);
   if (record.kind === "coordinator") await closeThreads(stateDir, record.id, io, await rowsOf(io, stateDir, record));
@@ -48,16 +50,16 @@ async function told(stateDir, id, io, extra = {}) {
 
 export async function enter(options, io) {
   const stateDir = stateDirectory(options.stateDir), talk = conversation(options.conversation);
-  if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name an hc terminal");
+  if (typeof options.terminal !== "string" || !options.terminal) throw new Error("terminal must name the agent's terminal");
   if (!Number.isInteger(options.pid) || options.pid <= 0) throw new Error("pid must be the agent's process id");
   if (typeof options.folder !== "string" || !isAbsolute(options.folder)) throw new Error("folder must be an absolute path");
   const read = () => terminals.read(io, options.terminal), seen = await read();
-  // A terminal that core is starting is read again under its session's lock, once its labels are complete.
-  const starting = readRecord(stateDir, seen.labels?.["projects.session"]);
+  // A terminal that core is starting is read again under its session's lock, once it says all it will.
+  const starting = readRecord(stateDir, terminals.session(seen));
   const row = starting ? await locked(stateDir, starting.id, read, io) : seen;
-  if (row.state !== "live") throw new Error(`Terminal ${row.address} is not live`);
-  const label = row.labels?.["projects.session"], here = terminals.holds(row, label) ? readRecord(stateDir, label) : undefined;
-  const reported = row.labels?.["projects.bound"] === "1", mine = terminals.agentPid(row) === options.pid;
+  if (!terminals.live(row)) throw new Error(`Terminal ${row.address} is not live`);
+  const label = terminals.session(row), here = terminals.holds(row, label) ? readRecord(stateDir, label) : undefined;
+  const reported = terminals.reported(row), mine = terminals.agentPid(row) === options.pid;
   if (here && reported && !mine) throw new Error(`Terminal ${row.address} already runs the session ${here.title}`);
   const started = reported ? undefined : here, kept = reported ? here : undefined;
   const same = kept && (options.replaced || kept.conversation?.id === talk.id);
@@ -72,13 +74,14 @@ export async function enter(options, io) {
   }
   const env = options.env ?? {};
   writeEnvironment(stateDir, Object.fromEntries(io.adapter.variables.filter(key => typeof env[key] === "string").map(key => [key, env[key]])));
-  writeControl(stateDir);
-  return told(stateDir, record.id, io, record.kind === "coordinator" ? await reopenThreads(stateDir, record, io) : {});
+  terminals.writeControl(stateDir);
+  const opening = kept?.id !== record.id;
+  return told(stateDir, record.id, io, record.kind === "coordinator" && opening ? await reopenThreads(stateDir, record, io) : {});
 }
 
 export async function leave(options, io) {
   const stateDir = stateDirectory(options.stateDir), row = await terminals.read(io, options.terminal);
-  const held = terminals.agentPid(row) === options.pid ? readRecord(stateDir, row.labels?.["projects.session"]) : undefined;
+  const held = terminals.agentPid(row) === options.pid ? readRecord(stateDir, terminals.session(row)) : undefined;
   if (held) await release(stateDir, held, row, io, terminals.unbind);
   return {};
 }

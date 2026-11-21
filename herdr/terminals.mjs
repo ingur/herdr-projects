@@ -1,12 +1,40 @@
-import { join } from "node:path";
-import * as hc from "../herdr/hc.mjs";
-import { alive } from "./state.mjs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as hc from "./hc.mjs";
 
 const UNLABEL = {
   "projects.session": "", "projects.pid": "", "projects.bound": "", "projects.control": "", "projects.changed": "", "projects.launched": "",
 };
 
-export const control = stateDir => JSON.stringify({ version: 3, command: [join(stateDir, "bin", "control")], stateDir });
+const launcher = stateDir => join(stateDir, "bin", "control");
+
+export const control = stateDir => JSON.stringify({ version: 3, command: [launcher(stateDir)], stateDir });
+
+const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+const script = fileURLToPath(new URL("../control.mjs", import.meta.url));
+
+// The command a client runs. The recorded node can go with an upgrade; the one on PATH then runs it.
+export function writeControl(stateDir) {
+  const path = launcher(stateDir), temporary = `${path}.${randomUUID()}`;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(temporary, `#!/bin/sh\nnode=${quote(process.execPath)}\n[ -x "$node" ] || node=node\nexec "$node" ${quote(script)} "$@"\n`, { mode: 0o755 });
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === "EPERM"; }
+}
+
+export const live = row => row.state === "live";
+export const session = row => row.labels?.["projects.session"];
+export const reported = row => row.labels?.["projects.bound"] === "1";
+export const place = row => ({ space: row.labels?.["herdr.space"], tab: row.labels?.["herdr.tab"] });
 
 export function agentPid(row) {
   return Number((row.labels?.["projects.pid"] ?? "").split("@")[0]);
@@ -57,17 +85,18 @@ export const mark = (io, address) => hc.label(io, address, { "projects.changed":
 
 export async function start(io, stateDir, id, { folder, space, tab, env, argv }) {
   if (!await hc.found(io, env, argv[0])) throw new Error(`${argv[0]} was not found on the PATH herdr starts it with`);
+  const placed = space === undefined ? undefined : tab ?? `pt-${id}`;
   const address = await hc.start(io, {
     folder, argv, env: { ...env, PROJECTS_STATE_DIR: stateDir },
     labels: {
-      ...(space === undefined ? {} : { "herdr.space": space, "herdr.tab": tab }),
+      ...(space === undefined ? {} : { "herdr.space": space, "herdr.tab": placed }),
       "projects.session": id, "projects.control": control(stateDir), "projects.launched": 1,
     },
   });
   const { pid } = await hc.terminal(io, address);
   if (!pid) throw new Error("hc reported no pid for the new terminal");
   await hc.label(io, address, { "projects.pid": `${pid}@${pid}` });
-  return address;
+  return { address, tab: placed };
 }
 
 export const bind = (io, stateDir, id, row, pid) => hc.label(io, row.address, {

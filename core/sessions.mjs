@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import * as mailbox from "./mailbox.mjs";
-import { locked, readEnvironment, readRecord, readRecords, rewrite, session, update, writeFile, writeRecord } from "./state.mjs";
-import * as terminals from "./terminals.mjs";
+import { locked, readEnvironment, readRecord, readRecords, rewrite, session, update, writeRecord } from "./state.mjs";
+import * as terminals from "../herdr/terminals.mjs";
 
 const errorText = error => error instanceof Error ? error.message : String(error);
 export const isFolder = path => Boolean(statSync(path, { throwIfNoEntry: false })?.isDirectory());
@@ -37,11 +35,12 @@ export function identity(record) {
 
 function view(stateDir, record, observed, error) {
   const own = observed?.terminal ?? observed?.shell, state = observed?.state ?? "stopped";
+  const { space, tab } = own ? terminals.place(own) : {};
   return {
     id: record.id, kind: record.kind, ...(record.project ? { project: record.project } : {}),
     title: record.title, titleSource: record.titleSource, folder: record.folder,
     resolved: record.resolved, rank: record.rank, created: record.created,
-    space: own?.labels["herdr.space"] ?? record.space, tab: own?.labels["herdr.tab"] ?? record.tab,
+    space: space ?? record.space, tab: tab ?? record.tab,
     ...(own ? { terminal: own.address } : {}),
     state, ...(observed?.status ? { status: observed.status } : {}),
     waiting: mailbox.waiting(stateDir, record.id),
@@ -91,7 +90,8 @@ export async function changed(stateDir, id, io, extra = {}) {
 }
 
 export function remember(stateDir, id, row, io) {
-  return update(stateDir, id, record => ({ space: row.labels["herdr.space"] ?? record.space, tab: row.labels["herdr.tab"] ?? record.tab }), io);
+  const { space, tab } = terminals.place(row);
+  return update(stateDir, id, record => ({ space: space ?? record.space, tab: tab ?? record.tab }), io);
 }
 
 export async function launch(stateDir, id, io, place) {
@@ -101,10 +101,10 @@ export async function launch(stateDir, id, io, place) {
       if (observed.state !== "stopped") return {};
       if (!isFolder(record.folder)) throw new Error(`The folder ${record.folder} is gone; say where it moved, then open the session`);
       let space = place ?? record.space;
-      if (place === undefined && record.kind === "thread") space = (await terminals.observe(io, record.project)).terminal?.labels["herdr.space"] ?? space;
-      const tab = space === undefined ? undefined : record.tab ?? `pt-${id}`;
-      const argv = (record.conversation && io.adapter.resume(record.conversation)) ?? io.adapter.start();
-      const address = await terminals.start(io, stateDir, id, { folder: record.folder, space, tab, env: readEnvironment(stateDir), argv });
+      const head = place === undefined && record.kind === "thread" ? (await terminals.observe(io, record.project)).terminal : undefined;
+      if (head) space = terminals.place(head).space ?? space;
+      const argv = (record.conversation && io.adapter.resume(record.conversation)) ?? io.adapter.start({ model: record.model, thinking: record.thinking });
+      const { address, tab } = await terminals.start(io, stateDir, id, { folder: record.folder, space, tab: record.tab, env: readEnvironment(stateDir), argv });
       // Starting first keeps the tab and the space alive; what the session left behind goes after.
       await terminals.vacate(io, observed.labelled, id, address);
       rewrite(stateDir, id, () => ({ space, tab }));
@@ -121,10 +121,7 @@ export async function stop(stateDir, id, io, rows) {
 }
 
 export async function closeThreads(stateDir, project, io, rows) {
-  await Promise.all(threads(stateDir, project).filter(thread => terminals.isOpen(rows, thread.id)).map(async thread => {
-    await update(stateDir, thread.id, () => ({ reopenWithProject: true }), io);
-    await stop(stateDir, thread.id, io, rows);
-  }));
+  await Promise.all(threads(stateDir, project).filter(thread => terminals.isOpen(rows, thread.id)).map(thread => stop(stateDir, thread.id, io, rows)));
 }
 
 export async function close(stateDir, record, io) {
@@ -134,11 +131,8 @@ export async function close(stateDir, record, io) {
 }
 
 export async function reopenThreads(stateDir, coordinator, io) {
-  const children = threads(stateDir, coordinator.id), errors = [];
-  const rows = children.length ? await terminals.all(io, stateDir) : [];
-  await Promise.all(children.filter(thread => thread.reopenWithProject || terminals.isOpen(rows, thread.id)).map(async thread => {
-    await update(stateDir, thread.id, () => ({ reopenWithProject: undefined }), io);
-    if (thread.resolved) return;
+  const errors = [];
+  await Promise.all(threads(stateDir, coordinator.id).filter(thread => !thread.resolved).map(async thread => {
     const { error } = await launch(stateDir, thread.id, io);
     if (error) errors.push(`${thread.title}: ${error}`);
   }));
@@ -152,12 +146,4 @@ export async function rename(stateDir, record, value, by, io) {
     return { title: name, titleSource: by };
   }, io);
   return changed(stateDir, record.id, io);
-}
-
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
-
-// The command a client runs. The recorded node can go with an upgrade; the one on PATH then runs it.
-export function writeControl(stateDir) {
-  const script = fileURLToPath(new URL("../control.mjs", import.meta.url));
-  writeFile(join(stateDir, "bin", "control"), `#!/bin/sh\nnode=${quote(process.execPath)}\n[ -x "$node" ] || node=node\nexec "$node" ${quote(script)} "$@"\n`, 0o755);
 }

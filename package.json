@@ -1,6 +1,6 @@
 {
   "name": "@ingur/herdr-projects",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Sessions, projects and mail for pi in herdr terminals",
   "type": "module",
   "license": "MIT",
